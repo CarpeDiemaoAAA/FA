@@ -362,7 +362,7 @@ _C.LOG.PATH = "runs/exp"
 
 def _update_config_from_file(config, cfg_file):
     config.defrost()
-    with open(cfg_file, 'r', encoding='utf-8') as f:
+    with open(cfg_file, 'r') as f:
         yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     for cfg in yaml_cfg.setdefault('BASE', ['']):
@@ -371,10 +371,8 @@ def _update_config_from_file(config, cfg_file):
                 config, os.path.join(os.path.dirname(cfg_file), cfg)
             )
     print('=> Merging a config file from {}'.format(cfg_file))
-    # Use UTF-8 encoding to properly handle Chinese characters in paths
-    with open(cfg_file, 'r', encoding='utf-8') as f:
-        loaded_cfg = config.load_cfg(f)
-    config.merge_from_other_cfg(loaded_cfg)
+    # print(config)
+    config.merge_from_file(cfg_file)
     config.freeze()
 
 

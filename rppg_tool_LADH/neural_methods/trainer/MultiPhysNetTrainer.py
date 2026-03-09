@@ -283,7 +283,7 @@ class MultiPhysNetTrainer(BaseTrainer):
             if not self.config.TEST.USE_LAST_EPOCH: 
                 valid_loss = self.valid(data_loader)
                 mean_valid_losses.append(valid_loss)
-                with open ('loss.csv', 'a', newline='') as csvfile:
+                with open ('/data01/mxl/rppg_tool_LADH/loss.csv', 'a', newline='') as csvfile:
                     csv_writer = csv.writer(csvfile)
                     data_to_add = [
                         epoch+1, np.mean(train_loss), valid_loss
@@ -617,8 +617,8 @@ class MultiPhysNetTrainer(BaseTrainer):
                     
 
         print('')
-        file_exists = os.path.isfile('result.csv')
-        with open('result.csv', 'a', newline='') as csvfile:
+        file_exists = os.path.isfile('/data01/mxl/rppg_tool_LADH/result.csv')
+        with open('/data01/mxl/rppg_tool_LADH/result.csv', 'a', newline='') as csvfile:
             # inference => How to be more Lupin
             #epoch_num = int(self.config.INFERENCE.MODEL_PATH.split('/')[-1].split('.')[0].split('_')[-1][5:]) + 1
             epoch_num = self.max_epoch_num #train
@@ -741,7 +741,7 @@ class MultiPhysNetTrainer(BaseTrainer):
                 csv_writer.writerow(data_to_add)
             else:
                 # only_test  hr_spo2_MAE
-                with open("MAE.csv", 'a', newline='') as csvf:
+                with open("/data01/mxl/MAE.csv", 'a', newline='') as csvf:
                     writer = csv.writer(csvf)
                     writer.writerow(data_to_add_hr_spo2_rr_MAE)
                 

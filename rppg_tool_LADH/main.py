@@ -195,7 +195,7 @@ if __name__ == "__main__":
             # print(f"dataset: {len(dataset)}")
             data_loader_dict['train'] = DataLoader(
                 dataset=train_data_loader,
-                num_workers=2,
+                num_workers=16,
                 batch_size=config.TRAIN.BATCH_SIZE,
                 shuffle=True,
                 worker_init_fn=seed_worker,
@@ -240,7 +240,7 @@ if __name__ == "__main__":
                 config_data=config.VALID.DATA)
             data_loader_dict["valid"] = DataLoader(
                 dataset=valid_data,
-                num_workers=2,
+                num_workers=16,
                 batch_size=config.TRAIN.BATCH_SIZE,  # batch size for val is the same as train
                 shuffle=False,
                 worker_init_fn=seed_worker,
@@ -291,7 +291,7 @@ if __name__ == "__main__":
                 config_data=config.TEST.DATA)
             data_loader_dict["test"] = DataLoader(
                 dataset=test_data,
-                num_workers=2,
+                num_workers=16,
                 batch_size=config.INFERENCE.BATCH_SIZE,
                 shuffle=False,
                 worker_init_fn=seed_worker,
@@ -330,7 +330,7 @@ if __name__ == "__main__":
             config_data=config.UNSUPERVISED.DATA)
         data_loader_dict["unsupervised"] = DataLoader(
             dataset=unsupervised_data,
-            num_workers=2,
+            num_workers=16,
             batch_size=1,
             shuffle=False,
             worker_init_fn=seed_worker,
