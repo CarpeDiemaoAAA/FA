@@ -297,8 +297,8 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         rr = rr.view(batch, length)
 
         # SpO2三路径预测：
-        # 路径1-从rPPG波形（detach防止SpO2损失干扰BVP编码器训练）
-        spo2_feat_rppg = self.spo2_from_rppg(rPPG.detach().unsqueeze(1))  # [B, 128]
+        # 路径1-从rPPG波形（不再detach，允许SpO2损失反传优化编码器）
+        spo2_feat_rppg = self.spo2_from_rppg(rPPG.unsqueeze(1))  # [B, 128]
         # 路径2-从融合视觉特征
         spo2_feat_visual = self.spo2_from_visual(x)  # [B, 32]
         # 路径3-从IR编码器特征（IR对SpO2最敏感，双模态时直接利用）
