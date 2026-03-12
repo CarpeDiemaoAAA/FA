@@ -55,6 +55,21 @@ class MultiPhysNetTrainer(BaseTrainer):
         else:
             raise ValueError("MultiPhysNet trainer initialized in incorrect toolbox mode!")
 
+    def _compute_spo2_loss(self, spo2_pred, spo2_label, multitask=False):
+        """SpO2损失计算：基于论文自适应权重公式的改进版本。
+        
+        单任务模式: MSE + 0.5*Huber (直接回归)
+        多任务模式: 0.01 * (MSE + 0.5*Huber) * (100 - mean_label) (自适应权重，避免压倒BVP/RR)
+        """
+        loss_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
+        loss_huber = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
+        if multitask:
+            mean_spo2 = spo2_label.mean().detach()
+            adaptive_weight = (100.0 - mean_spo2).clamp(min=1.0)
+            return 0.01 * (loss_mse + 0.5 * loss_huber) * adaptive_weight
+        else:
+            return loss_mse + 0.5 * loss_huber
+
     def train(self, data_loader):
         """Training routine for model"""
         if data_loader["train"] is None:
@@ -109,17 +124,7 @@ class MultiPhysNetTrainer(BaseTrainer):
                     elif self.task == "spo2":
                         _, spo2_pred, _ = self.model(batch[0].to(torch.float32).to(self.device))
                         spo2_label = batch[2].to(torch.float32).to(self.device).squeeze(-1)
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_c = spo2_pred - spo2_pred.mean()
-                            spo2_label_c = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_c * spo2_label_c).sum()
-                            pearson_den = torch.sqrt((spo2_pred_c**2).sum() * (spo2_label_c**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=False)
                         running_loss_spo2 += loss.item()
                     elif self.task == "rr":
                         # print(f"RR label values: {batch[3].to(torch.float32).to(self.device)[:10]}")  # 打印前10个值
@@ -154,21 +159,10 @@ class MultiPhysNetTrainer(BaseTrainer):
                         rr_pred = (rr_pred - torch.mean(rr_pred)) / (torch.std(rr_pred) + 1e-8)
                         rr_label = (rr_label - torch.mean(rr_label)) / (torch.std(rr_label) + 1e-8)
                         loss_bvp = self.loss_model(rPPG, BVP_label)                     
-                        # SpO2改进损失：MSE + SmoothL1 + 条件性Pearson（批次std>0.5时才启用）
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss_spo2 = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss_spo2 = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=True)
                         loss_rr = self.loss_model(rr_pred, rr_label)
                 
-                        loss = loss_bvp + 0.3 * loss_spo2 + loss_rr
+                        loss = loss_bvp + loss_spo2 + loss_rr
                         running_loss_bvp += loss_bvp.item()
                         running_loss_spo2 += loss_spo2.item()
                         running_loss_rr += loss_rr.item()
@@ -190,17 +184,7 @@ class MultiPhysNetTrainer(BaseTrainer):
                     elif self.task == "spo2":
                         _, spo2_pred, _ = self.model(face_data, face_IR_data)
                         spo2_label = batch[3].to(torch.float32).to(self.device).squeeze(-1)
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_c = spo2_pred - spo2_pred.mean()
-                            spo2_label_c = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_c * spo2_label_c).sum()
-                            pearson_den = torch.sqrt((spo2_pred_c**2).sum() * (spo2_label_c**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=False)
                         running_loss_spo2 += loss.item()
                     elif self.task == "rr":
                         _, _, rr_pred = self.model(face_data, face_IR_data)
@@ -225,22 +209,11 @@ class MultiPhysNetTrainer(BaseTrainer):
                         
 
                         loss_bvp = self.loss_model(rPPG, BVP_label)
-                        # SpO2改进损失：MSE + SmoothL1 + 条件性Pearson（批次std>0.5时才启用）
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss_spo2 = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss_spo2 = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=True)
                         loss_rr = self.loss_model(rr_pred, rr_label)
                 
                         
-                        loss = loss_bvp + 0.3 * loss_spo2 + loss_rr
+                        loss = loss_bvp + loss_spo2 + loss_rr
                         
                         running_loss_bvp += loss_bvp.item()
                         running_loss_spo2 += loss_spo2.item()
@@ -333,18 +306,7 @@ class MultiPhysNetTrainer(BaseTrainer):
                     elif self.task == "spo2":
                         spo2_label = valid_batch[2].to(torch.float32).to(self.device).squeeze(-1)
                         _, spo2_pred, _ = self.model(valid_batch[0].to(torch.float32).to(self.device))
-                        # SpO2改进损失：与训练一致
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=False)
                         valid_loss_spo2 += loss.item()
                     elif self.task == "rr":
                         # print(f"RR Validing values: {valid_batch[3].to(torch.float32).to(self.device)[:10]}")  # 打印前10个值
@@ -377,21 +339,10 @@ class MultiPhysNetTrainer(BaseTrainer):
                         rr_label = (rr_label - torch.mean(rr_label)) / (torch.std(rr_label) + 1e-8)
                         
                         loss_bvp = self.loss_model(rPPG, BVP_label)
-                        # SpO2改进损失：与训练一致
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss_spo2 = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss_spo2 = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=True)
                         loss_rr = self.loss_model(rr_pred, rr_label)
 
-                        loss =   loss_bvp + 0.3 * loss_spo2 + loss_rr
+                        loss = loss_bvp + loss_spo2 + loss_rr
                         # loss = 600 * loss_bvp + loss_spo2 +  600 * loss_rr
                         # loss = 100 * loss_bvp + loss_spo2 + 100 * loss_rr
                         # print(f"loss_bvp: {loss_bvp}"
@@ -413,21 +364,10 @@ class MultiPhysNetTrainer(BaseTrainer):
                         BVP_label = (BVP_label - torch.mean(BVP_label)) / (torch.std(BVP_label) + 1e-8)
                         
                         loss_bvp = self.loss_model(rPPG, BVP_label)
-                        # SpO2改进损失：与训练一致
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss_spo2 = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss_spo2 = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=True)
                         loss_rr = self.loss_model(rr_pred, rr_label)
                         
-                        loss =   loss_bvp + 0.3 * loss_spo2 + loss_rr
+                        loss = loss_bvp + loss_spo2 + loss_rr
                         valid_loss_bvp += loss_bvp.item()
                         valid_loss_spo2 += loss_spo2.item()
                         valid_loss_rr += loss_rr.item()
@@ -441,18 +381,7 @@ class MultiPhysNetTrainer(BaseTrainer):
                     elif self.task == "spo2":        
                         _, spo2_pred, _ = self.model(face_data, face_IR_data)
                         spo2_label = valid_batch[3].to(torch.float32).to(self.device).squeeze(-1)
-                        # SpO2改进损失：与训练一致
-                        loss_spo2_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-                        loss_spo2_smooth = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-                        if spo2_pred.shape[0] > 1 and spo2_label.std() > 0.5:
-                            spo2_pred_centered = spo2_pred - spo2_pred.mean()
-                            spo2_label_centered = spo2_label - spo2_label.mean()
-                            pearson_num = (spo2_pred_centered * spo2_label_centered).sum()
-                            pearson_den = torch.sqrt((spo2_pred_centered**2).sum() * (spo2_label_centered**2).sum() + 1e-8)
-                            loss_spo2_pearson = 1.0 - pearson_num / pearson_den
-                        else:
-                            loss_spo2_pearson = torch.tensor(0.0, device=self.device)
-                        loss = loss_spo2_mse + loss_spo2_smooth + 1.5 * loss_spo2_pearson
+                        loss = self._compute_spo2_loss(spo2_pred, spo2_label, multitask=False)
                         valid_loss_spo2 += loss.item()
                     elif self.task == "rr":
                         _, _, rr_pred = self.model(face_data, face_IR_data)

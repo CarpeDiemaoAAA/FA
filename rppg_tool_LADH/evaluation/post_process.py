@@ -35,7 +35,7 @@ def mag2db(mag):
 def _calculate_fft_hr(ppg_signal, fs=60, low_pass=0.75, high_pass=2.5):
     """Calculate heart rate based on PPG using Fast Fourier transform (FFT)."""
     ppg_signal = np.expand_dims(ppg_signal, 0)
-    N = _next_power_of_2(ppg_signal.shape[1])
+    N = _next_power_of_2(ppg_signal.shape[1]) * 4  # 零填充×4提升频率分辨率
     f_ppg, pxx_ppg = scipy.signal.periodogram(ppg_signal, fs=fs, nfft=N, detrend=False)
     fmask_ppg = np.argwhere((f_ppg >= low_pass) & (f_ppg <= high_pass))
     mask_ppg = np.take(f_ppg, fmask_ppg)
@@ -46,7 +46,7 @@ def _calculate_fft_hr(ppg_signal, fs=60, low_pass=0.75, high_pass=2.5):
 def _calculate_fft_rr(rr_signal, fs=30, low_pass=0.1, high_pass=0.5):
     """Calculate heart rate based on PPG using Fast Fourier transform (FFT)."""
     rr_signal = np.expand_dims(rr_signal, 0)
-    N = _next_power_of_2(rr_signal.shape[1])
+    N = _next_power_of_2(rr_signal.shape[1]) * 4  # 零填充×4提升频率分辨率
     f_ppg, pxx_ppg = scipy.signal.periodogram(rr_signal, fs=fs, nfft=N, detrend=False)
     fmask_ppg = np.argwhere((f_ppg >= low_pass) & (f_ppg <= high_pass))
     mask_ppg = np.take(f_ppg, fmask_ppg)

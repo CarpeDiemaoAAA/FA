@@ -204,51 +204,31 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
 
         self.poolspa = nn.AdaptiveAvgPool3d((frames, 1, 1))
 
-        # SpO2路径1：从rPPG波形提取特征（保留原始路径）
-        self.spo2_from_rppg = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Conv1d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(4),
-            nn.Flatten(),
-        )
-        
-        # SpO2路径2：直接从编码器视觉特征提取
-        self.spo2_from_visual = nn.Sequential(
+        # SpO2双通道：基于Beer-Lambert法则，分别从RGB和IR编码器的预融合特征中提取光学比率信息
+        # 路径1：从RGB编码器特征提取可见光反射特征（含AC/DC比率信息）
+        self.spo2_from_rgb = nn.Sequential(
             nn.AdaptiveAvgPool3d((1, 1, 1)),
             nn.Flatten(),
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.1),
         )
         
-        # SpO2路径3：从IR编码器特征直接提取（红外光吸收率与血氧浓度直接相关）
+        # 路径2：从IR编码器特征提取红外反射特征（IR吸收率与血氧浓度直接相关）
         self.spo2_from_ir = nn.Sequential(
             nn.AdaptiveAvgPool3d((1, 1, 1)),
             nn.Flatten(),
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.1),
         )
         
-        # SpO2融合预测头：128(rppg) + 32(visual) + 32(ir) = 192
+        # SpO2轻量预测头：32(rgb) + 32(ir) = 64 → 参数更少，减少过拟合风险
         self.spo2_head = nn.Sequential(
-            nn.Linear(128 + 32 + 32, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Dropout(0.1),
+            nn.Linear(32, 1),
             nn.Sigmoid()
         )
 
@@ -260,7 +240,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
 
     def _init_spo2_weights(self):
         """对SpO2相关模块进行Kaiming初始化，提升训练起点质量"""
-        for module_list in [self.spo2_from_rppg, self.spo2_from_visual, self.spo2_from_ir, self.spo2_head]:
+        for module_list in [self.spo2_from_rgb, self.spo2_from_ir, self.spo2_head]:
             for m in module_list.modules():
                 if isinstance(m, (nn.Linear, nn.Conv1d)):
                     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -273,6 +253,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
     def forward(self, x1, x2=None):  # Batch_size*[3, T, 128,128]
         [batch, channel, length, width, height] = x1.shape   
         x2_ir_feat = None  # 保存IR编码器原始特征，供SpO2专用路径使用
+        x1_visual = None   # 保存RGB编码器预融合特征，供SpO2光学比率路径使用
         if x2 is not None:
             x1_visual = self.share_m(x1)
             x2_ir_feat = self.ir_encoder(x2)
@@ -296,21 +277,20 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         rr = self.rr_branch(x)
         rr = rr.view(batch, length)
 
-        # SpO2三路径预测：
-        # 路径1-从rPPG波形（不再detach，允许SpO2损失反传优化编码器）
-        spo2_feat_rppg = self.spo2_from_rppg(rPPG.unsqueeze(1))  # [B, 128]
-        # 路径2-从融合视觉特征
-        spo2_feat_visual = self.spo2_from_visual(x)  # [B, 32]
-        # 路径3-从IR编码器特征（IR对SpO2最敏感，双模态时直接利用）
-        if x2_ir_feat is not None:
-            spo2_feat_ir = self.spo2_from_ir(x2_ir_feat)  # [B, 32]
+        # SpO2双通道预测：基于预融合RGB+IR特征的光学比率原理
+        if x1_visual is not None and x2_ir_feat is not None:
+            # 双模态：分别提取RGB和IR的预融合特征（保留各自光学吸收特性）
+            spo2_feat_rgb = self.spo2_from_rgb(x1_visual)   # [B, 32]
+            spo2_feat_ir = self.spo2_from_ir(x2_ir_feat)    # [B, 32]
         else:
+            # 单模态：仅使用编码器输出特征
+            spo2_feat_rgb = self.spo2_from_rgb(x)  # [B, 32]
             spo2_feat_ir = torch.zeros(batch, 32, device=x.device)
         
-        spo2_feat = torch.cat([spo2_feat_rppg, spo2_feat_visual, spo2_feat_ir], dim=1)  # [B, 192]
+        spo2_feat = torch.cat([spo2_feat_rgb, spo2_feat_ir], dim=1)  # [B, 64]
         spo2 = self.spo2_head(spo2_feat)
         spo2 = spo2.view(batch, 1)
-        spo2 = spo2 * 15 + 85
+        spo2 = spo2 * 18 + 82  # 输出范围[82, 100]，覆盖低SpO2样本
 
         return rPPG, spo2, rr
 
