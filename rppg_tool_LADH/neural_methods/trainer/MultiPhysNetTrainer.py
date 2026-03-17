@@ -58,44 +58,49 @@ class MultiPhysNetTrainer(BaseTrainer):
                 "MultiPhysNet trainer initialized in incorrect toolbox mode!")
 
     def _compute_spo2_loss(self, spo2_pred, spo2_label, multitask=False):
-        """SpO2损失计算：回归损失 + CCC一致性相关损失 + 方差匹配。
-
-        组成：
-        1. MSE + Huber: 基础回归损失，保证绝对精度
-        2. CCC Loss: 一致性相关系数损失，鼓励预测与标签的线性关系
-        3. 方差匹配: 防止预测值塌缩到均值附近（解决散点聚集问题）
+        """SpO2损失计算：回归损失 + 排序损失 + 方差匹配。
+        
+        核心设计思想：
+        1. MSE + Huber: 保证绝对精度
+        2. 排序损失(Ranking Loss): 对batch内所有样本对，如果label_i > label_j，
+           则强制pred_i > pred_j。即使SpO2方差极小也能有效工作。
+        3. 方差匹配: 惩罚预测塌缩到均值（预测std应接近标签std）
         """
         loss_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
         loss_huber = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-
-        # CCC (Concordance Correlation Coefficient) Loss - 鼓励线性关系
+        
         pred_flat = spo2_pred.flatten()
         label_flat = spo2_label.flatten()
-        loss_ccc = torch.tensor(0.0, device=spo2_pred.device)
+        n = pred_flat.shape[0]
+        loss_rank = torch.tensor(0.0, device=spo2_pred.device)
         loss_var = torch.tensor(0.0, device=spo2_pred.device)
-
-        if pred_flat.shape[0] > 2:
-            pred_mean = pred_flat.mean()
-            label_mean = label_flat.mean()
+        
+        if n > 1:
+            # === 排序损失：直接优化预测的顺序一致性 ===
+            # 对所有样本对(i,j)计算：若label_i > label_j，则pred_i也应 > pred_j
+            pred_diff = pred_flat.unsqueeze(1) - pred_flat.unsqueeze(0)   # [N, N]
+            label_diff = label_flat.unsqueeze(1) - label_flat.unsqueeze(0) # [N, N]
+            
+            # 排除相同标签的对（只看有差异的对）
+            valid_mask = (label_diff.abs() > 0.1)  # SpO2差异 > 0.1% 才计算
+            if valid_mask.any():
+                # 正负号指示：label_diff > 0 时 target=+1, <0 时 target=-1
+                target = torch.sign(label_diff[valid_mask])
+                # MarginRankingLoss风格：max(0, -target * pred_diff + margin)
+                margin = 0.3  # 预测差异应至少0.3%
+                rank_violations = torch.clamp(-target * pred_diff[valid_mask] + margin, min=0)
+                loss_rank = rank_violations.mean()
+            
+            # === 方差匹配：防止预测塌缩到均值 ===
             pred_var = pred_flat.var()
             label_var = label_flat.var().detach()
-            covar = ((pred_flat - pred_mean) *
-                     (label_flat - label_mean)).mean()
-
-            # CCC = 2*cov / (var_p + var_l + (mean_p - mean_l)^2)
-            ccc = (2.0 * covar) / (pred_var + label_var +
-                                   (pred_mean - label_mean) ** 2 + 1e-8)
-            loss_ccc = 1.0 - ccc
-
-            # 方差匹配：鼓励预测的分散程度接近标签
-            loss_var = (torch.sqrt(pred_var + 1e-8) -
-                        torch.sqrt(label_var + 1e-8)) ** 2
-
+            loss_var = (torch.sqrt(pred_var + 1e-6) - torch.sqrt(label_var + 1e-6)) ** 2
+        
         if multitask:
-            # 权重从0.01提升到0.15，让SPO2梯度与BVP/RR处于同一量级
-            return 0.15 * (loss_mse + 0.5 * loss_huber + 3.0 * loss_ccc + 0.5 * loss_var)
+            # 多任务权重：0.3，让SPO2梯度与BVP/RR真正平衡
+            return 0.3 * (loss_mse + 0.5 * loss_huber + 2.0 * loss_rank + 0.5 * loss_var)
         else:
-            return loss_mse + 0.5 * loss_huber + 3.0 * loss_ccc + 0.5 * loss_var
+            return loss_mse + 0.5 * loss_huber + 2.0 * loss_rank + 0.5 * loss_var
 
     def train(self, data_loader):
         """Training routine for model"""

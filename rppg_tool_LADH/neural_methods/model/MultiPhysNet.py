@@ -208,49 +208,60 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
 
         self.poolspa = nn.AdaptiveAvgPool3d((frames, 1, 1))
 
-        # SpO2双通道：基于Beer-Lambert法则，保留时间维度捕获AC/DC脉搏变化
-        # 路径1：从RGB编码器提取时空特征（保留4个时间步以捕获AC分量信息）
-        self.spo2_rgb_temporal = nn.Sequential(
+# ===== SpO2 多尺度特征提取 =====
+        # 路径1：高层时空特征（从编码器最终输出提取全局模式）
+        self.spo2_rgb_high = nn.Sequential(
             nn.AdaptiveAvgPool3d((4, 1, 1)),
             nn.Flatten(),
-            nn.Linear(64 * 4, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-        )
-
-        # 路径2：从IR编码器提取时空特征（IR通道的AC/DC比与血氧浓度直接相关）
-        self.spo2_ir_temporal = nn.Sequential(
-            nn.AdaptiveAvgPool3d((4, 1, 1)),
-            nn.Flatten(),
-            nn.Linear(64 * 4, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-        )
-
-        # 路径3：RGB-IR交互特征，模拟R = (AC_red/DC_red) / (AC_ir/DC_ir) 比率关系
-        self.spo2_cross = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-        )
-
-        # SpO2预测头：32(rgb) + 32(ir) + 16(cross) = 80
-        # 不使用Sigmoid：避免输出压缩到窄范围，直接回归SpO2偏移量
-        self.spo2_head = nn.Sequential(
-            nn.Linear(80, 48),
+            nn.Linear(64 * 4, 48),
             nn.BatchNorm1d(48),
-            nn.ReLU(),
-            nn.Dropout(0.15),
-            nn.Linear(48, 24),
-            nn.BatchNorm1d(24),
-            nn.ReLU(),
-            nn.Linear(24, 1),
+            nn.GELU(),
         )
+        self.spo2_ir_high = nn.Sequential(
+            nn.AdaptiveAvgPool3d((4, 1, 1)),
+            nn.Flatten(),
+            nn.Linear(64 * 4, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+        )
+        
+        # 路径2：通道统计特征（捕获AC/DC比率——SpO2的物理基础）
+        # 对每个通道计算mean(DC分量)和std(AC分量)，形成2*64=128维统计描述
+        self.spo2_rgb_stats = nn.Sequential(
+            nn.Linear(128, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+        )
+        self.spo2_ir_stats = nn.Sequential(
+            nn.Linear(128, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+        )
+        
+        # 路径3：RGB-IR交叉注意力（学习跨模态光学比率关系）
+        self.spo2_cross_attn = nn.Sequential(
+            nn.Linear(96, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+            nn.Linear(48, 32),
+        )
+        
+        # SpO2预测头：48(rgb_high) + 48(ir_high) + 48(rgb_stats) + 48(ir_stats) + 32(cross) = 224
+        # 使用残差结构防止梯度消失，输出为SpO2偏移量
+        self.spo2_pre = nn.Sequential(
+            nn.Linear(224, 96),
+            nn.BatchNorm1d(96),
+            nn.GELU(),
+            nn.Dropout(0.15),
+        )
+        self.spo2_head = nn.Sequential(
+            nn.Linear(96, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+            nn.Linear(48, 1),
+        )
+        # 残差快捷连接：直接从关键特征预测SpO2
+        self.spo2_shortcut = nn.Linear(224, 1)
 
         self.ir_encoder = IR_SE_CNN()
         self.fusion_net = FusionNet()
@@ -258,11 +269,30 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         # SpO2相关层的Kaiming初始化
         self._init_spo2_weights()
 
+    def _compute_channel_stats(self, x):
+        """计算通道级统计特征：mean(DC分量) + std(AC分量)
+        
+        Args:
+            x: [B, C, T, H, W] 编码器特征
+        Returns:
+            stats: [B, 2*C] 每通道的均值和标准差
+        """
+        b, c = x.shape[0], x.shape[1]
+        x_flat = x.view(b, c, -1)  # [B, C, T*H*W]
+        ch_mean = x_flat.mean(dim=2)  # [B, C] DC分量
+        ch_std = x_flat.std(dim=2) + 1e-6  # [B, C] AC分量
+        return torch.cat([ch_mean, ch_std], dim=1)  # [B, 2C]
+
     def _init_spo2_weights(self):
         """对SpO2相关模块进行Kaiming初始化，提升训练起点质量"""
-        for module_list in [self.spo2_rgb_temporal, self.spo2_ir_temporal, self.spo2_cross, self.spo2_head]:
+        spo2_modules = [
+            self.spo2_rgb_high, self.spo2_ir_high,
+            self.spo2_rgb_stats, self.spo2_ir_stats,
+            self.spo2_cross_attn, self.spo2_pre, self.spo2_head,
+        ]
+        for module_list in spo2_modules:
             for m in module_list.modules():
-                if isinstance(m, (nn.Linear, nn.Conv1d)):
+                if isinstance(m, nn.Linear):
                     nn.init.kaiming_normal_(
                         m.weight, mode='fan_out', nonlinearity='relu')
                     if m.bias is not None:
@@ -270,6 +300,9 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
                 elif isinstance(m, nn.BatchNorm1d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
+        # 快捷连接用小权重初始化（让残差起步时接近0）
+        nn.init.normal_(self.spo2_shortcut.weight, std=0.01)
+        nn.init.constant_(self.spo2_shortcut.bias, 0)
 
     def forward(self, x1, x2=None):  # Batch_size*[3, T, 128,128]
         [batch, channel, length, width, height] = x1.shape
@@ -297,29 +330,43 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         rr = self.rr_branch(x)
         rr = rr.view(batch, length)
 
-        # SpO2双通道预测：基于时空特征+交叉比率的直接回归
+# ===== SpO2 多尺度预测 =====
         if x1_visual is not None and x2_ir_feat is not None:
-            # 双模态：分别提取RGB和IR的时空特征（保留时间维度捕获AC/DC变化）
-            spo2_feat_rgb = self.spo2_rgb_temporal(x1_visual)   # [B, 32]
-            spo2_feat_ir = self.spo2_ir_temporal(x2_ir_feat)    # [B, 32]
-            # 交叉特征：乘积捕获比率关系 + 差异捕获吸收差异
-            cross_input = torch.cat([spo2_feat_rgb * spo2_feat_ir,
-                                     # [B, 64]
-                                     spo2_feat_rgb - spo2_feat_ir], dim=1)
-            spo2_cross_feat = self.spo2_cross(cross_input)  # [B, 16]
+            # 路径1：高层时空特征
+            rgb_high = self.spo2_rgb_high(x1_visual)      # [B, 48]
+            ir_high = self.spo2_ir_high(x2_ir_feat)       # [B, 48]
+            
+            # 路径2：通道统计特征（AC/DC比率信息）
+            rgb_stats = self._compute_channel_stats(x1_visual)  # [B, 128]
+            rgb_stats = self.spo2_rgb_stats(rgb_stats)          # [B, 48]
+            ir_stats = self._compute_channel_stats(x2_ir_feat)  # [B, 128]
+            ir_stats = self.spo2_ir_stats(ir_stats)             # [B, 48]
+            
+            # 路径3：交叉注意力（模拟R值 = AC_red/DC_red / AC_ir/DC_ir）
+            cross_in = torch.cat([rgb_high * ir_high,
+                                  rgb_high - ir_high], dim=1)  # [B, 96]
+            cross_feat = self.spo2_cross_attn(cross_in)        # [B, 32]
         else:
-            # 单模态fallback
-            spo2_feat_rgb = self.spo2_rgb_temporal(x)  # [B, 32]
-            spo2_feat_ir = torch.zeros(batch, 32, device=x.device)
-            spo2_cross_feat = torch.zeros(batch, 16, device=x.device)
-
-        spo2_feat = torch.cat(
-            [spo2_feat_rgb, spo2_feat_ir, spo2_cross_feat], dim=1)  # [B, 80]
-        spo2 = self.spo2_head(spo2_feat)
-        spo2 = spo2.view(batch, 1)
-        # 直接回归：以典型SpO2均值为中心，无Sigmoid压缩
-        spo2 = 94.0 + spo2
-        spo2 = torch.clamp(spo2, 70.0, 100.0)  # 安全范围约束
+            rgb_high = self.spo2_rgb_high(x)                   # [B, 48]
+            ir_high = torch.zeros(batch, 48, device=x.device)
+            rgb_stats = self._compute_channel_stats(x)
+            rgb_stats = self.spo2_rgb_stats(rgb_stats)         # [B, 48]
+            ir_stats = torch.zeros(batch, 48, device=x.device)
+            cross_feat = torch.zeros(batch, 32, device=x.device)
+        
+        # 拼接所有特征
+        spo2_feat = torch.cat([rgb_high, ir_high, rgb_stats, ir_stats, cross_feat], dim=1)  # [B, 224]
+        
+        # 残差预测：主路径 + 快捷连接
+        spo2_main = self.spo2_pre(spo2_feat)        # [B, 96]
+        spo2_main = self.spo2_head(spo2_main)       # [B, 1]
+        spo2_skip = self.spo2_shortcut(spo2_feat)   # [B, 1]
+        spo2_offset = spo2_main + spo2_skip          # [B, 1]
+        
+        spo2 = spo2_offset.view(batch, 1)
+        # 软映射：tanh将输出限制在(-1,1)，再映射到SpO2范围
+        # tanh(x)*9 + 94 → 范围[85, 103]，中心94，梯度始终非零
+        spo2 = torch.tanh(spo2) * 9.0 + 94.0
 
         return rPPG, spo2, rr
 
