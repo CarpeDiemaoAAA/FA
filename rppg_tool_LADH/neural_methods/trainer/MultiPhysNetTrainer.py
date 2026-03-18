@@ -4,6 +4,7 @@ from collections import OrderedDict
 import sys
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from evaluation.metrics import calculate_metrics
 from evaluation.metrics import calculate_metrics_RR
@@ -40,6 +41,8 @@ class MultiPhysNetTrainer(BaseTrainer):
         self.valid_state = config.VALID.DATA.INFO.STATE
         self.test_state = config.TEST.DATA.INFO.STATE
         self.lr = config.TRAIN.LR
+        self.log_dir = config.LOG.PATH
+        os.makedirs(self.log_dir, exist_ok=True)
 
         self.model = PhysNet_padding_Encoder_Decoder_MAX(
             frames=config.MODEL.MultiPhysNet.FRAME_NUM).to(self.device)
@@ -51,56 +54,145 @@ class MultiPhysNetTrainer(BaseTrainer):
                 self.model.parameters(), lr=config.TRAIN.LR, weight_decay=1e-4)
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer, max_lr=config.TRAIN.LR, epochs=config.TRAIN.EPOCHS, steps_per_epoch=self.num_train_batches)
+            self._prepare_spo2_label_histogram(data_loader)
         elif config.TOOLBOX_MODE == "only_test":
             pass
         else:
             raise ValueError(
                 "MultiPhysNet trainer initialized in incorrect toolbox mode!")
 
+    def _prepare_spo2_label_histogram(self, data_loader):
+        """预计算训练集SpO2标签分布，用于损失中的样本重加权。"""
+        self.spo2_bin_edges = None
+        self.spo2_bin_weights = None
+
+        if self.task not in ["spo2", "both"]:
+            return
+
+        train_loader = data_loader.get("train", None)
+        if train_loader is None:
+            return
+        dataset = getattr(train_loader, "dataset", None)
+        if dataset is None or not hasattr(dataset, "labels_spo2"):
+            return
+
+        label_paths = getattr(dataset, "labels_spo2", [])
+        if len(label_paths) == 0:
+            return
+
+        means = []
+        for path in label_paths:
+            try:
+                arr = np.load(path).astype(np.float32).reshape(-1)
+                means.append(float(np.mean(arr)))
+            except Exception:
+                continue
+
+        if len(means) < 16:
+            return
+
+        means = np.asarray(means, dtype=np.float32)
+        bins = 24
+        lo, hi = float(np.min(means)), float(np.max(means))
+        if hi - lo < 1e-6:
+            return
+
+        edges = np.linspace(lo, hi + 1e-6, bins + 1, dtype=np.float32)
+        ids = np.clip(np.digitize(
+            means, edges[1:-1], right=False), 0, bins - 1)
+        counts = np.bincount(ids, minlength=bins).astype(np.float32)
+        median_count = np.median(
+            counts[counts > 0]) if np.any(counts > 0) else 1.0
+
+        # 稀有区间更高权重，避免模型塌缩到94附近
+        rarity = np.ones_like(counts, dtype=np.float32)
+        nz = counts > 0
+        rarity[nz] = (median_count / counts[nz]) ** 0.75
+        rarity = np.clip(rarity, 0.6, 3.5)
+
+        self.spo2_bin_edges = edges
+        self.spo2_bin_weights = rarity
+
+        print("[SpO2 Loss Reweighting]")
+        print(f"  Label mean±std: {means.mean():.2f}±{means.std():.2f}")
+        print(
+            f"  Bin range: {lo:.2f} ~ {hi:.2f} | non-empty bins: {int(np.sum(counts > 0))}/{bins}")
+
+    def _get_spo2_sample_weights(self, spo2_label):
+        """根据全局分布给每个样本赋权（稀有标签更高）。"""
+        if self.spo2_bin_edges is None or self.spo2_bin_weights is None:
+            return torch.ones_like(spo2_label)
+
+        label_np = spo2_label.detach().view(-1).cpu().numpy().astype(np.float32)
+        ids = np.clip(
+            np.digitize(label_np, self.spo2_bin_edges[1:-1], right=False),
+            0,
+            len(self.spo2_bin_weights) - 1,
+        )
+        w = self.spo2_bin_weights[ids]
+        w = w / (np.mean(w) + 1e-8)
+        w = np.clip(w, 0.6, 3.5)
+        return torch.as_tensor(w, dtype=spo2_label.dtype, device=spo2_label.device).view_as(spo2_label)
+
     def _compute_spo2_loss(self, spo2_pred, spo2_label, multitask=False):
-        """SpO2损失计算：回归损失 + 排序损失 + 方差匹配。
-        
-        核心设计思想：
-        1. MSE + Huber: 保证绝对精度
-        2. 排序损失(Ranking Loss): 对batch内所有样本对，如果label_i > label_j，
-           则强制pred_i > pred_j。即使SpO2方差极小也能有效工作。
-        3. 方差匹配: 惩罚预测塌缩到均值（预测std应接近标签std）
-        """
-        loss_mse = torch.nn.MSELoss()(spo2_pred, spo2_label)
-        loss_huber = torch.nn.SmoothL1Loss()(spo2_pred, spo2_label)
-        
+        """SpO2损失：分布重加权回归 + 排序一致性 + 线性差分 + 统计匹配。"""
+        sample_w = self._get_spo2_sample_weights(spo2_label)
+        sq_err = (spo2_pred - spo2_label) ** 2
+        huber = F.smooth_l1_loss(spo2_pred, spo2_label, reduction='none')
+        loss_mse = (sample_w * sq_err).mean()
+        loss_huber = (sample_w * huber).mean()
+
         pred_flat = spo2_pred.flatten()
         label_flat = spo2_label.flatten()
         n = pred_flat.shape[0]
         loss_rank = torch.tensor(0.0, device=spo2_pred.device)
+        loss_pair = torch.tensor(0.0, device=spo2_pred.device)
         loss_var = torch.tensor(0.0, device=spo2_pred.device)
-        
+        loss_mean = torch.tensor(0.0, device=spo2_pred.device)
+
         if n > 1:
-            # === 排序损失：直接优化预测的顺序一致性 ===
-            # 对所有样本对(i,j)计算：若label_i > label_j，则pred_i也应 > pred_j
-            pred_diff = pred_flat.unsqueeze(1) - pred_flat.unsqueeze(0)   # [N, N]
-            label_diff = label_flat.unsqueeze(1) - label_flat.unsqueeze(0) # [N, N]
-            
-            # 排除相同标签的对（只看有差异的对）
-            valid_mask = (label_diff.abs() > 0.1)  # SpO2差异 > 0.1% 才计算
+            pred_diff = pred_flat.unsqueeze(
+                1) - pred_flat.unsqueeze(0)   # [N, N]
+            label_diff = label_flat.unsqueeze(
+                1) - label_flat.unsqueeze(0)  # [N, N]
+
+            # 仅在有区分度的标签对上约束
+            valid_mask = (label_diff.abs() > 0.1)
             if valid_mask.any():
-                # 正负号指示：label_diff > 0 时 target=+1, <0 时 target=-1
                 target = torch.sign(label_diff[valid_mask])
-                # MarginRankingLoss风格：max(0, -target * pred_diff + margin)
-                margin = 0.3  # 预测差异应至少0.3%
-                rank_violations = torch.clamp(-target * pred_diff[valid_mask] + margin, min=0)
+                # 标签差异越大，margin越大，提升线性区分能力
+                adaptive_margin = 0.12 + 0.35 * label_diff[valid_mask].abs()
+                rank_violations = torch.clamp(
+                    -target * pred_diff[valid_mask] + adaptive_margin, min=0)
                 loss_rank = rank_violations.mean()
-            
-            # === 方差匹配：防止预测塌缩到均值 ===
+
+                # 差分线性损失：不仅顺序正确，还要差值接近
+                pair_w = torch.clamp(
+                    label_diff[valid_mask].abs(), min=0.1, max=6.0)
+                loss_pair = (
+                    pair_w * (pred_diff[valid_mask] - label_diff[valid_mask]).abs()).mean() / pair_w.mean()
+
             pred_var = pred_flat.var()
             label_var = label_flat.var().detach()
-            loss_var = (torch.sqrt(pred_var + 1e-6) - torch.sqrt(label_var + 1e-6)) ** 2
-        
+            loss_var = (torch.sqrt(pred_var + 1e-6) -
+                        torch.sqrt(label_var + 1e-6)) ** 2
+            # 均值匹配：抑制整体偏移
+            loss_mean = (pred_flat.mean() - label_flat.mean().detach()) ** 2
+
+        base_loss = (
+            1.20 * loss_mse +
+            0.70 * loss_huber +
+            1.60 * loss_rank +
+            0.85 * loss_pair +
+            0.45 * loss_var +
+            0.30 * loss_mean
+        )
+
         if multitask:
-            # 多任务权重：0.3，让SPO2梯度与BVP/RR真正平衡
-            return 0.3 * (loss_mse + 0.5 * loss_huber + 2.0 * loss_rank + 0.5 * loss_var)
+            # 提升SpO2任务权重（由数据分析可知标签分布窄，需更强监督）
+            return 0.45 * base_loss
         else:
-            return loss_mse + 0.5 * loss_huber + 2.0 * loss_rank + 0.5 * loss_var
+            return base_loss
 
     def train(self, data_loader):
         """Training routine for model"""
@@ -315,7 +407,8 @@ class MultiPhysNetTrainer(BaseTrainer):
             if not self.config.TEST.USE_LAST_EPOCH:
                 valid_loss = self.valid(data_loader)
                 mean_valid_losses.append(valid_loss)
-                with open('/data01/mxl/rppg_tool_LADH/loss.csv', 'a', newline='') as csvfile:
+                loss_csv_path = os.path.join(self.log_dir, 'loss.csv')
+                with open(loss_csv_path, 'a', newline='') as csvfile:
                     csv_writer = csv.writer(csvfile)
                     data_to_add = [
                         epoch+1, np.mean(train_loss), valid_loss
@@ -644,8 +737,9 @@ class MultiPhysNetTrainer(BaseTrainer):
                         rr_labels[subj_index][sort_index] = rr_label[idx]
 
         print('')
-        file_exists = os.path.isfile('/data01/mxl/rppg_tool_LADH/result.csv')
-        with open('/data01/mxl/rppg_tool_LADH/result.csv', 'a', newline='') as csvfile:
+        result_csv_path = os.path.join(self.log_dir, 'result.csv')
+        file_exists = os.path.isfile(result_csv_path)
+        with open(result_csv_path, 'a', newline='') as csvfile:
             # inference => How to be more Lupin
             # epoch_num = int(self.config.INFERENCE.MODEL_PATH.split('/')[-1].split('.')[0].split('_')[-1][5:]) + 1
             epoch_num = self.max_epoch_num  # train
@@ -786,7 +880,8 @@ class MultiPhysNetTrainer(BaseTrainer):
                 csv_writer.writerow(data_to_add)
             else:
                 # only_test  hr_spo2_MAE
-                with open("/data01/mxl/MAE.csv", 'a', newline='') as csvf:
+                mae_csv_path = os.path.join(self.log_dir, 'MAE.csv')
+                with open(mae_csv_path, 'a', newline='') as csvf:
                     writer = csv.writer(csvf)
                     writer.writerow(data_to_add_hr_spo2_rr_MAE)
 

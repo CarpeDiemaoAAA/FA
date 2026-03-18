@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.modules.utils import _triple
 
 
@@ -224,7 +225,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.BatchNorm1d(48),
             nn.GELU(),
         )
-        
+
         # 路径2：通道统计特征（捕获AC/DC比率——SpO2的物理基础）
         # 对每个通道计算mean(DC分量)和std(AC分量)，形成2*64=128维统计描述
         self.spo2_rgb_stats = nn.Sequential(
@@ -237,7 +238,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.BatchNorm1d(48),
             nn.GELU(),
         )
-        
+
         # 路径3：RGB-IR交叉注意力（学习跨模态光学比率关系）
         self.spo2_cross_attn = nn.Sequential(
             nn.Linear(96, 48),
@@ -245,7 +246,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.GELU(),
             nn.Linear(48, 32),
         )
-        
+
         # SpO2预测头：48(rgb_high) + 48(ir_high) + 48(rgb_stats) + 48(ir_stats) + 32(cross) = 224
         # 使用残差结构防止梯度消失，输出为SpO2偏移量
         self.spo2_pre = nn.Sequential(
@@ -260,8 +261,28 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.GELU(),
             nn.Linear(48, 1),
         )
+        # 尾部专家：针对稀有SpO2区间（低氧/高氧）单独建模
+        self.spo2_tail_head = nn.Sequential(
+            nn.Linear(96, 48),
+            nn.BatchNorm1d(48),
+            nn.GELU(),
+            nn.Linear(48, 1),
+        )
+        self.spo2_gate = nn.Sequential(
+            nn.Linear(96, 24),
+            nn.GELU(),
+            nn.Linear(24, 1),
+            nn.Sigmoid(),
+        )
         # 残差快捷连接：直接从关键特征预测SpO2
         self.spo2_shortcut = nn.Linear(224, 1)
+
+        # 可学习映射参数（由数据分布初始化）
+        # 训练集均值约94.4，采用可学习中心与尺度，避免固定映射造成压缩
+        self.spo2_center = nn.Parameter(
+            torch.tensor(94.4, dtype=torch.float32))
+        self.spo2_scale_raw = nn.Parameter(
+            torch.tensor(2.95, dtype=torch.float32))
 
         self.ir_encoder = IR_SE_CNN()
         self.fusion_net = FusionNet()
@@ -271,7 +292,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
 
     def _compute_channel_stats(self, x):
         """计算通道级统计特征：mean(DC分量) + std(AC分量)
-        
+
         Args:
             x: [B, C, T, H, W] 编码器特征
         Returns:
@@ -289,6 +310,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             self.spo2_rgb_high, self.spo2_ir_high,
             self.spo2_rgb_stats, self.spo2_ir_stats,
             self.spo2_cross_attn, self.spo2_pre, self.spo2_head,
+            self.spo2_tail_head, self.spo2_gate,
         ]
         for module_list in spo2_modules:
             for m in module_list.modules():
@@ -335,13 +357,13 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             # 路径1：高层时空特征
             rgb_high = self.spo2_rgb_high(x1_visual)      # [B, 48]
             ir_high = self.spo2_ir_high(x2_ir_feat)       # [B, 48]
-            
+
             # 路径2：通道统计特征（AC/DC比率信息）
             rgb_stats = self._compute_channel_stats(x1_visual)  # [B, 128]
             rgb_stats = self.spo2_rgb_stats(rgb_stats)          # [B, 48]
             ir_stats = self._compute_channel_stats(x2_ir_feat)  # [B, 128]
             ir_stats = self.spo2_ir_stats(ir_stats)             # [B, 48]
-            
+
             # 路径3：交叉注意力（模拟R值 = AC_red/DC_red / AC_ir/DC_ir）
             cross_in = torch.cat([rgb_high * ir_high,
                                   rgb_high - ir_high], dim=1)  # [B, 96]
@@ -353,20 +375,25 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             rgb_stats = self.spo2_rgb_stats(rgb_stats)         # [B, 48]
             ir_stats = torch.zeros(batch, 48, device=x.device)
             cross_feat = torch.zeros(batch, 32, device=x.device)
-        
+
         # 拼接所有特征
-        spo2_feat = torch.cat([rgb_high, ir_high, rgb_stats, ir_stats, cross_feat], dim=1)  # [B, 224]
-        
+        spo2_feat = torch.cat(
+            [rgb_high, ir_high, rgb_stats, ir_stats, cross_feat], dim=1)  # [B, 224]
+
         # 残差预测：主路径 + 快捷连接
         spo2_main = self.spo2_pre(spo2_feat)        # [B, 96]
-        spo2_main = self.spo2_head(spo2_main)       # [B, 1]
+        spo2_base = self.spo2_head(spo2_main)       # [B, 1]
+        spo2_tail = self.spo2_tail_head(spo2_main)  # [B, 1]
+        gate = self.spo2_gate(spo2_main)            # [B, 1]
+        spo2_main = (1.0 - gate) * spo2_base + gate * spo2_tail
         spo2_skip = self.spo2_shortcut(spo2_feat)   # [B, 1]
         spo2_offset = spo2_main + spo2_skip          # [B, 1]
-        
+
         spo2 = spo2_offset.view(batch, 1)
-        # 软映射：tanh将输出限制在(-1,1)，再映射到SpO2范围
-        # tanh(x)*9 + 94 → 范围[85, 103]，中心94，梯度始终非零
-        spo2 = torch.tanh(spo2) * 9.0 + 94.0
+        # 可学习软映射：大部分区域保持近线性，同时允许数据驱动中心/尺度自适应
+        # scale = 3 + softplus(raw) 保证正值且不至于过小
+        scale = 3.0 + F.softplus(self.spo2_scale_raw)
+        spo2 = self.spo2_center + scale * torch.tanh(spo2 / 2.0)
 
         return rPPG, spo2, rr
 

@@ -5,7 +5,8 @@
 # Written by Ze Liu
 # --------------------------------------------------------'
 
-import os, re
+import os
+import re
 import yaml
 from yacs.config import CfgNode as CN
 
@@ -24,6 +25,10 @@ _C.TRAIN.EPOCHS = 50
 # _C.TRAIN.TASK = 'bvp'
 _C.TRAIN.BATCH_SIZE = 4
 _C.TRAIN.LR = 1e-4
+_C.TRAIN.SPO2_BALANCED_SAMPLING = False
+_C.TRAIN.SPO2_SAMPLING_BINS = 24
+_C.TRAIN.SPO2_SAMPLING_POW = 0.7
+_C.TRAIN.SPO2_SAMPLING_STD_BOOST = 0.4
 # Optimizer
 _C.TRAIN.OPTIMIZER = CN()
 # Optimizer Epsilon
@@ -57,7 +62,8 @@ _C.TRAIN.DATA.FS = 0
 _C.TRAIN.DATA.DATA_PATH = ''
 _C.TRAIN.DATA.EXP_DATA_NAME = ''
 _C.TRAIN.DATA.CACHED_PATH = 'PreprocessedData'
-_C.TRAIN.DATA.FILE_LIST_PATH = os.path.join(_C.TRAIN.DATA.CACHED_PATH, 'DataFileLists')
+_C.TRAIN.DATA.FILE_LIST_PATH = os.path.join(
+    _C.TRAIN.DATA.CACHED_PATH, 'DataFileLists')
 _C.TRAIN.DATA.DATASET = ''
 _C.TRAIN.DATA.DO_PREPROCESS = False
 _C.TRAIN.DATA.DATA_FORMAT = 'NDCHW'
@@ -122,7 +128,8 @@ _C.VALID.DATA.FS = 0
 _C.VALID.DATA.DATA_PATH = ''
 _C.VALID.DATA.EXP_DATA_NAME = ''
 _C.VALID.DATA.CACHED_PATH = 'PreprocessedData'
-_C.VALID.DATA.FILE_LIST_PATH = os.path.join(_C.VALID.DATA.CACHED_PATH, 'DataFileLists')
+_C.VALID.DATA.FILE_LIST_PATH = os.path.join(
+    _C.VALID.DATA.CACHED_PATH, 'DataFileLists')
 _C.VALID.DATA.DATASET = ''
 _C.VALID.DATA.DO_PREPROCESS = False
 _C.VALID.DATA.DATA_FORMAT = 'NDCHW'
@@ -190,7 +197,8 @@ _C.TEST.DATA.FS = 0
 _C.TEST.DATA.DATA_PATH = ''
 _C.TEST.DATA.EXP_DATA_NAME = ''
 _C.TEST.DATA.CACHED_PATH = 'PreprocessedData'
-_C.TEST.DATA.FILE_LIST_PATH = os.path.join(_C.TEST.DATA.CACHED_PATH, 'DataFileLists')
+_C.TEST.DATA.FILE_LIST_PATH = os.path.join(
+    _C.TEST.DATA.CACHED_PATH, 'DataFileLists')
 _C.TEST.DATA.DATASET = ''
 _C.TEST.DATA.DO_PREPROCESS = False
 _C.TEST.DATA.DATA_FORMAT = 'NDCHW'
@@ -255,7 +263,8 @@ _C.UNSUPERVISED.DATA.FS = 0
 _C.UNSUPERVISED.DATA.DATA_PATH = ''
 _C.UNSUPERVISED.DATA.EXP_DATA_NAME = ''
 _C.UNSUPERVISED.DATA.CACHED_PATH = 'PreprocessedData'
-_C.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(_C.UNSUPERVISED.DATA.CACHED_PATH, 'DataFileLists')
+_C.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(
+    _C.UNSUPERVISED.DATA.CACHED_PATH, 'DataFileLists')
 _C.UNSUPERVISED.DATA.DATASET = ''
 _C.UNSUPERVISED.DATA.DO_PREPROCESS = False
 _C.UNSUPERVISED.DATA.DATA_FORMAT = 'NDCHW'
@@ -285,7 +294,7 @@ _C.UNSUPERVISED.DATA.PREPROCESS.RESIZE = CN()
 _C.UNSUPERVISED.DATA.PREPROCESS.RESIZE.W = 128
 _C.UNSUPERVISED.DATA.PREPROCESS.RESIZE.H = 128
 
-### -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Model settings
 # -----------------------------------------------------------------------------
 _C.MODEL = CN()
@@ -387,38 +396,49 @@ def update_config(config, args):
     # update flag from config file
     _update_config_from_file(config, args.config_file)
     config.defrost()
-    
+
     # UPDATE TRAIN PATHS
     if config.TRAIN.DATA.FILE_LIST_PATH == default_TRAIN_FILE_LIST_PATH:
-        config.TRAIN.DATA.FILE_LIST_PATH = os.path.join(config.TRAIN.DATA.CACHED_PATH, 'DataFileLists')
+        config.TRAIN.DATA.FILE_LIST_PATH = os.path.join(
+            config.TRAIN.DATA.CACHED_PATH, 'DataFileLists')
 
     if config.TRAIN.DATA.EXP_DATA_NAME == '':
         config.TRAIN.DATA.EXP_DATA_NAME = "_".join([config.TRAIN.DATA.DATASET, "SizeW{0}".format(
             str(config.TRAIN.DATA.PREPROCESS.RESIZE.W)), "SizeH{0}".format(str(config.TRAIN.DATA.PREPROCESS.RESIZE.W)), "ClipLength{0}".format(
             str(config.TRAIN.DATA.PREPROCESS.CHUNK_LENGTH)), "DataType{0}".format("_".join(config.TRAIN.DATA.PREPROCESS.DATA_TYPE)),
-                                      "DataAug{0}".format("_".join(config.TRAIN.DATA.PREPROCESS.DATA_AUG)),
-                                      "LabelType{0}".format(config.TRAIN.DATA.PREPROCESS.LABEL_TYPE),
-                                      "Crop_face{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
-                                      "Backend{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.BACKEND),
-                                      "Large_box{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
-                                      "Large_size{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
-                                      "Dyamic_Det{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
-                                        "det_len{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
-                                        "Median_face_box{0}".format(config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
-                                              ])
-    config.TRAIN.DATA.CACHED_PATH = os.path.join(config.TRAIN.DATA.CACHED_PATH, config.TRAIN.DATA.EXP_DATA_NAME)
+            "DataAug{0}".format(
+                "_".join(config.TRAIN.DATA.PREPROCESS.DATA_AUG)),
+            "LabelType{0}".format(config.TRAIN.DATA.PREPROCESS.LABEL_TYPE),
+            "Crop_face{0}".format(
+            config.TRAIN.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
+            "Backend{0}".format(
+            config.TRAIN.DATA.PREPROCESS.CROP_FACE.BACKEND),
+            "Large_box{0}".format(
+            config.TRAIN.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
+            "Large_size{0}".format(
+            config.TRAIN.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
+            "Dyamic_Det{0}".format(
+            config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
+            "det_len{0}".format(
+                config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
+            "Median_face_box{0}".format(
+                config.TRAIN.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
+        ])
+    config.TRAIN.DATA.CACHED_PATH = os.path.join(
+        config.TRAIN.DATA.CACHED_PATH, config.TRAIN.DATA.EXP_DATA_NAME)
 
     name, ext = os.path.splitext(config.TRAIN.DATA.FILE_LIST_PATH)
-    if not ext: # no file extension
+    if not ext:  # no file extension
         FOLD_STR = '_' + config.TRAIN.DATA.FOLD.FOLD_NAME if config.TRAIN.DATA.FOLD.FOLD_NAME else ''
-        config.TRAIN.DATA.FILE_LIST_PATH = os.path.join(config.TRAIN.DATA.FILE_LIST_PATH, \
-                                                        config.TRAIN.DATA.EXP_DATA_NAME + '_' + \
-                                                        str(config.TRAIN.DATA.BEGIN) + '_' + \
-                                                        str(config.TRAIN.DATA.END) + \
+        config.TRAIN.DATA.FILE_LIST_PATH = os.path.join(config.TRAIN.DATA.FILE_LIST_PATH,
+                                                        config.TRAIN.DATA.EXP_DATA_NAME + '_' +
+                                                        str(config.TRAIN.DATA.BEGIN) + '_' +
+                                                        str(config.TRAIN.DATA.END) +
                                                         FOLD_STR + '.csv')
     elif ext != '.csv':
-        raise ValueError('TRAIN dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
-    
+        raise ValueError(
+            'TRAIN dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
+
     if ext == '.csv' and config.TRAIN.DATA.DO_PREPROCESS:
         raise ValueError('User specified TRAIN dataset FILE_LIST_PATH .csv file already exists. \
                          Please turn DO_PREPROCESS to False or delete existing TRAIN dataset FILE_LIST_PATH .csv file.')
@@ -426,76 +446,98 @@ def update_config(config, args):
     if not config.TEST.USE_LAST_EPOCH and config.VALID.DATA.DATASET is not None:
         # UPDATE VALID PATHS
         if config.VALID.DATA.FILE_LIST_PATH == default_VALID_FILE_LIST_PATH:
-            config.VALID.DATA.FILE_LIST_PATH = os.path.join(config.VALID.DATA.CACHED_PATH, 'DataFileLists')
+            config.VALID.DATA.FILE_LIST_PATH = os.path.join(
+                config.VALID.DATA.CACHED_PATH, 'DataFileLists')
 
         if config.VALID.DATA.EXP_DATA_NAME == '':
             config.VALID.DATA.EXP_DATA_NAME = "_".join([config.VALID.DATA.DATASET, "SizeW{0}".format(
                 str(config.VALID.DATA.PREPROCESS.RESIZE.W)), "SizeH{0}".format(str(config.VALID.DATA.PREPROCESS.RESIZE.W)), "ClipLength{0}".format(
                 str(config.VALID.DATA.PREPROCESS.CHUNK_LENGTH)), "DataType{0}".format("_".join(config.VALID.DATA.PREPROCESS.DATA_TYPE)),
-                                        "DataAug{0}".format("_".join(config.VALID.DATA.PREPROCESS.DATA_AUG)),
-                                        "LabelType{0}".format(config.VALID.DATA.PREPROCESS.LABEL_TYPE),
-                                        "Crop_face{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
-                                        "Backend{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.BACKEND),
-                                        "Large_box{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
-                                        "Large_size{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
-                                        "Dyamic_Det{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
-                                          "det_len{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
-                                          "Median_face_box{0}".format(config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
-                                                ])
-        config.VALID.DATA.CACHED_PATH = os.path.join(config.VALID.DATA.CACHED_PATH, config.VALID.DATA.EXP_DATA_NAME)
+                "DataAug{0}".format(
+                    "_".join(config.VALID.DATA.PREPROCESS.DATA_AUG)),
+                "LabelType{0}".format(config.VALID.DATA.PREPROCESS.LABEL_TYPE),
+                "Crop_face{0}".format(
+                config.VALID.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
+                "Backend{0}".format(
+                config.VALID.DATA.PREPROCESS.CROP_FACE.BACKEND),
+                "Large_box{0}".format(
+                config.VALID.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
+                "Large_size{0}".format(
+                config.VALID.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
+                "Dyamic_Det{0}".format(
+                config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
+                "det_len{0}".format(
+                    config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
+                "Median_face_box{0}".format(
+                    config.VALID.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
+            ])
+        config.VALID.DATA.CACHED_PATH = os.path.join(
+            config.VALID.DATA.CACHED_PATH, config.VALID.DATA.EXP_DATA_NAME)
 
         name, ext = os.path.splitext(config.VALID.DATA.FILE_LIST_PATH)
         if not ext:  # no file extension
             FOLD_STR = '_' + config.VALID.DATA.FOLD.FOLD_NAME if config.VALID.DATA.FOLD.FOLD_NAME else ''
-            config.VALID.DATA.FILE_LIST_PATH = os.path.join(config.VALID.DATA.FILE_LIST_PATH, \
-                                                            config.VALID.DATA.EXP_DATA_NAME + '_' + \
-                                                            str(config.VALID.DATA.BEGIN) + '_' + \
-                                                            str(config.VALID.DATA.END) + \
+            config.VALID.DATA.FILE_LIST_PATH = os.path.join(config.VALID.DATA.FILE_LIST_PATH,
+                                                            config.VALID.DATA.EXP_DATA_NAME + '_' +
+                                                            str(config.VALID.DATA.BEGIN) + '_' +
+                                                            str(config.VALID.DATA.END) +
                                                             FOLD_STR + '.csv')
         elif ext != '.csv':
-            raise ValueError('VALIDATION dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
+            raise ValueError(
+                'VALIDATION dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
 
         if ext == '.csv' and config.VALID.DATA.DO_PREPROCESS:
             raise ValueError('User specified VALIDATION dataset FILE_LIST_PATH .csv file already exists. \
                             Please turn DO_PREPROCESS to False or delete existing VALIDATION dataset FILE_LIST_PATH .csv file.')
     elif not config.TEST.USE_LAST_EPOCH and config.VALID.DATA.DATASET is None:
-        raise ValueError('VALIDATION dataset is not provided despite USE_LAST_EPOCH being False!')
+        raise ValueError(
+            'VALIDATION dataset is not provided despite USE_LAST_EPOCH being False!')
 
     # UPDATE TEST PATHS
     if config.TEST.DATA.FILE_LIST_PATH == default_TEST_FILE_LIST_PATH:
-        config.TEST.DATA.FILE_LIST_PATH = os.path.join(config.TEST.DATA.CACHED_PATH, 'DataFileLists')
+        config.TEST.DATA.FILE_LIST_PATH = os.path.join(
+            config.TEST.DATA.CACHED_PATH, 'DataFileLists')
 
     if config.TEST.DATA.EXP_DATA_NAME == '':
         config.TEST.DATA.EXP_DATA_NAME = "_".join([config.TEST.DATA.DATASET, "SizeW{0}".format(
             str(config.TEST.DATA.PREPROCESS.RESIZE.W)), "SizeH{0}".format(str(config.TEST.DATA.PREPROCESS.RESIZE.H)), "ClipLength{0}".format(
             str(config.TEST.DATA.PREPROCESS.CHUNK_LENGTH)), "DataType{0}".format("_".join(config.TEST.DATA.PREPROCESS.DATA_TYPE)),
-                                      "DataAug{0}".format("_".join(config.TEST.DATA.PREPROCESS.DATA_AUG)),
-                                      "LabelType{0}".format(config.TEST.DATA.PREPROCESS.LABEL_TYPE),
-                                      "Crop_face{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
-                                      "Backend{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.BACKEND),
-                                      "Large_box{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
-                                      "Large_size{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
-                                      "Dyamic_Det{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
-                                        "det_len{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
-                                        "Median_face_box{0}".format(config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
-                                              ])
-    config.TEST.DATA.CACHED_PATH = os.path.join(config.TEST.DATA.CACHED_PATH, config.TEST.DATA.EXP_DATA_NAME)
+            "DataAug{0}".format(
+                "_".join(config.TEST.DATA.PREPROCESS.DATA_AUG)),
+            "LabelType{0}".format(config.TEST.DATA.PREPROCESS.LABEL_TYPE),
+            "Crop_face{0}".format(
+            config.TEST.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
+            "Backend{0}".format(
+            config.TEST.DATA.PREPROCESS.CROP_FACE.BACKEND),
+            "Large_box{0}".format(
+            config.TEST.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
+            "Large_size{0}".format(
+            config.TEST.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
+            "Dyamic_Det{0}".format(
+            config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
+            "det_len{0}".format(
+                config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
+            "Median_face_box{0}".format(
+                config.TEST.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX)
+        ])
+    config.TEST.DATA.CACHED_PATH = os.path.join(
+        config.TEST.DATA.CACHED_PATH, config.TEST.DATA.EXP_DATA_NAME)
 
     name, ext = os.path.splitext(config.TEST.DATA.FILE_LIST_PATH)
-    if not ext: # no file extension
+    if not ext:  # no file extension
         FOLD_STR = '_' + config.TEST.DATA.FOLD.FOLD_NAME if config.TEST.DATA.FOLD.FOLD_NAME else ''
-        config.TEST.DATA.FILE_LIST_PATH = os.path.join(config.TEST.DATA.FILE_LIST_PATH, \
-                                                       config.TEST.DATA.EXP_DATA_NAME + '_' + \
-                                                       str(config.TEST.DATA.BEGIN) + '_' + \
-                                                       str(config.TEST.DATA.END) + \
+        config.TEST.DATA.FILE_LIST_PATH = os.path.join(config.TEST.DATA.FILE_LIST_PATH,
+                                                       config.TEST.DATA.EXP_DATA_NAME + '_' +
+                                                       str(config.TEST.DATA.BEGIN) + '_' +
+                                                       str(config.TEST.DATA.END) +
                                                        FOLD_STR + '.csv')
     elif ext != '.csv':
-        raise ValueError('TEST dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
+        raise ValueError(
+            'TEST dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
 
     if ext == '.csv' and config.TEST.DATA.DO_PREPROCESS:
         raise ValueError('User specified TEST dataset FILE_LIST_PATH .csv file already exists. \
                          Please turn DO_PREPROCESS to False or delete existing TEST dataset FILE_LIST_PATH .csv file.')
-    
 
     # UPDATE MODEL_FILE_NAME IF NEEDED
     if any(aug != 'None' for aug in config.TRAIN.DATA.PREPROCESS.DATA_AUG + config.VALID.DATA.PREPROCESS.DATA_AUG + config.TEST.DATA.PREPROCESS.DATA_AUG):
@@ -512,15 +554,18 @@ def update_config(config, args):
                 test_name_idx = 1
             if 'Motion' in config.TRAIN.DATA.PREPROCESS.DATA_AUG:
                 model_file_name_parts = config.TRAIN.MODEL_FILE_NAME.split('_')
-                model_file_name_parts[train_name_idx] = 'MA-' + model_file_name_parts[train_name_idx]
+                model_file_name_parts[train_name_idx] = 'MA-' + \
+                    model_file_name_parts[train_name_idx]
                 config.TRAIN.MODEL_FILE_NAME = '_'.join(model_file_name_parts)
             if 'Motion' in config.VALID.DATA.PREPROCESS.DATA_AUG:
                 model_file_name_parts = config.TRAIN.MODEL_FILE_NAME.split('_')
-                model_file_name_parts[valid_name_idx] = 'MA-' + model_file_name_parts[valid_name_idx]
+                model_file_name_parts[valid_name_idx] = 'MA-' + \
+                    model_file_name_parts[valid_name_idx]
                 config.TRAIN.MODEL_FILE_NAME = '_'.join(model_file_name_parts)
             if 'Motion' in config.TEST.DATA.PREPROCESS.DATA_AUG:
                 model_file_name_parts = config.TRAIN.MODEL_FILE_NAME.split('_')
-                model_file_name_parts[test_name_idx] = 'MA-' + model_file_name_parts[test_name_idx]
+                model_file_name_parts[test_name_idx] = 'MA-' + \
+                    model_file_name_parts[test_name_idx]
                 config.TRAIN.MODEL_FILE_NAME = '_'.join(model_file_name_parts)
         else:
             raise ValueError(f'MODEL_FILE_NAME does not follow expected naming pattern of [TRAIN_SET]_[VALID_SET]_[TEST_SET]! \
@@ -528,59 +573,77 @@ def update_config(config, args):
 
     # ENSURE USE_PSEUDO_LABELS IS NOT TRUE FOR UNSUPERVISED METHODS
     if config.TOOLBOX_MODE == 'unsupervised_method' and config.UNSUPERVISED.DATA.PREPROCESS.USE_PSUEDO_PPG_LABEL == True:
-        raise ValueError('Pseudo PPG labels are NOT supported for unsupervised methods.')
+        raise ValueError(
+            'Pseudo PPG labels are NOT supported for unsupervised methods.')
 
     # UPDATE UNSUPERVISED PATHS
     if config.UNSUPERVISED.DATA.FILE_LIST_PATH == default_UNSUPERVISED_FILE_LIST_PATH:
-        config.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(config.UNSUPERVISED.DATA.CACHED_PATH, 'DataFileLists')
+        config.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(
+            config.UNSUPERVISED.DATA.CACHED_PATH, 'DataFileLists')
 
     if config.UNSUPERVISED.DATA.EXP_DATA_NAME == '':
         config.UNSUPERVISED.DATA.EXP_DATA_NAME = "_".join([config.UNSUPERVISED.DATA.DATASET, "SizeW{0}".format(
             str(config.UNSUPERVISED.DATA.PREPROCESS.RESIZE.W)), "SizeH{0}".format(str(config.UNSUPERVISED.DATA.PREPROCESS.RESIZE.W)), "ClipLength{0}".format(
             str(config.UNSUPERVISED.DATA.PREPROCESS.CHUNK_LENGTH)), "DataType{0}".format("_".join(config.UNSUPERVISED.DATA.PREPROCESS.DATA_TYPE)),
-                                      "DataAug{0}".format("_".join(config.UNSUPERVISED.DATA.PREPROCESS.DATA_AUG)),
-                                      "LabelType{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.LABEL_TYPE),
-                                      "Crop_face{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
-                                      "Backend{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.BACKEND),
-                                      "Large_box{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
-                                      "Large_size{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
-                                      "Dyamic_Det{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
-                                        "det_len{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
-                                        "Median_face_box{0}".format(config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX),
-                                        "unsupervised"
-                                              ])
-    config.UNSUPERVISED.DATA.CACHED_PATH = os.path.join(config.UNSUPERVISED.DATA.CACHED_PATH, config.UNSUPERVISED.DATA.EXP_DATA_NAME)
+            "DataAug{0}".format(
+                "_".join(config.UNSUPERVISED.DATA.PREPROCESS.DATA_AUG)),
+            "LabelType{0}".format(
+                config.UNSUPERVISED.DATA.PREPROCESS.LABEL_TYPE),
+            "Crop_face{0}".format(
+            config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DO_CROP_FACE),
+            "Backend{0}".format(
+            config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.BACKEND),
+            "Large_box{0}".format(
+            config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.USE_LARGE_FACE_BOX),
+            "Large_size{0}".format(
+            config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.LARGE_BOX_COEF),
+            "Dyamic_Det{0}".format(
+            config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION),
+            "det_len{0}".format(
+                config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY),
+            "Median_face_box{0}".format(
+                config.UNSUPERVISED.DATA.PREPROCESS.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX),
+            "unsupervised"
+        ])
+    config.UNSUPERVISED.DATA.CACHED_PATH = os.path.join(
+        config.UNSUPERVISED.DATA.CACHED_PATH, config.UNSUPERVISED.DATA.EXP_DATA_NAME)
 
     name, ext = os.path.splitext(config.UNSUPERVISED.DATA.FILE_LIST_PATH)
-    if not ext: # no file extension
+    if not ext:  # no file extension
         FOLD_STR = '_' + config.UNSUPERVISED.DATA.FOLD.FOLD_NAME if config.UNSUPERVISED.DATA.FOLD.FOLD_NAME else ''
-        config.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(config.UNSUPERVISED.DATA.FILE_LIST_PATH, \
-                                                        config.UNSUPERVISED.DATA.EXP_DATA_NAME + '_' + \
-                                                        str(config.UNSUPERVISED.DATA.BEGIN) + '_' + \
-                                                        str(config.UNSUPERVISED.DATA.END) + \
-                                                        FOLD_STR + '.csv')
+        config.UNSUPERVISED.DATA.FILE_LIST_PATH = os.path.join(config.UNSUPERVISED.DATA.FILE_LIST_PATH,
+                                                               config.UNSUPERVISED.DATA.EXP_DATA_NAME + '_' +
+                                                               str(config.UNSUPERVISED.DATA.BEGIN) + '_' +
+                                                               str(config.UNSUPERVISED.DATA.END) +
+                                                               FOLD_STR + '.csv')
     elif ext != '.csv':
-        raise ValueError('UNSUPERVISED dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
+        raise ValueError(
+            'UNSUPERVISED dataset FILE_LIST_PATH must either be a directory path or a .csv file name')
 
     if ext == '.csv' and config.UNSUPERVISED.DATA.DO_PREPROCESS:
         raise ValueError('User specified UNSUPERVISED dataset FILE_LIST_PATH .csv file already exists. \
                          Please turn DO_PREPROCESS to False or delete existing UNSUPERVISED dataset FILE_LIST_PATH .csv file.')
 
-    # Establish the directory to hold pre-trained models from a given experiment inside 
+    # Establish the directory to hold pre-trained models from a given experiment inside
     # the configured log directory (runs/exp by default)
-    config.MODEL.MODEL_DIR = os.path.join(config.LOG.PATH, config.TRAIN.DATA.EXP_DATA_NAME, config.MODEL.MODEL_DIR)
+    config.MODEL.MODEL_DIR = os.path.join(
+        config.LOG.PATH, config.TRAIN.DATA.EXP_DATA_NAME, config.MODEL.MODEL_DIR)
 
     # Establish the directory to hold outputs saved during testing inside the
     # configured log directory (runs/exp by default)
     if config.TOOLBOX_MODE == 'train_and_test' or config.TOOLBOX_MODE == 'only_test':
-        config.TEST.OUTPUT_SAVE_DIR = os.path.join(config.LOG.PATH, config.TEST.DATA.EXP_DATA_NAME, 'saved_test_outputs')
+        config.TEST.OUTPUT_SAVE_DIR = os.path.join(
+            config.LOG.PATH, config.TEST.DATA.EXP_DATA_NAME, 'saved_test_outputs')
     elif config.TOOLBOX_MODE == 'unsupervised_method':
-        config.UNSUPERVISED.OUTPUT_SAVE_DIR = os.path.join(config.LOG.PATH, config.UNSUPERVISED.DATA.EXP_DATA_NAME, 'saved_outputs')
+        config.UNSUPERVISED.OUTPUT_SAVE_DIR = os.path.join(
+            config.LOG.PATH, config.UNSUPERVISED.DATA.EXP_DATA_NAME, 'saved_outputs')
     else:
-        raise ValueError('TOOLBOX_MODE only supports train_and_test, only_test, or unsupervised_method!')
+        raise ValueError(
+            'TOOLBOX_MODE only supports train_and_test, only_test, or unsupervised_method!')
 
     config.freeze()
     return
+
 
 def get_config(args):
     # Return a clone so that the defaults will not be altered
@@ -589,5 +652,3 @@ def get_config(args):
     update_config(config, args)
     # print(config)
     return config
-
-

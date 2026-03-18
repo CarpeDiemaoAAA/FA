@@ -11,6 +11,7 @@ from dataset import data_loader
 from neural_methods import trainer
 from unsupervised_methods.unsupervised_predictor import unsupervised_predict
 from torch.utils.data import DataLoader
+from torch.utils.data import WeightedRandomSampler
 
 RANDOM_SEED = 100
 torch.manual_seed(RANDOM_SEED)
@@ -18,7 +19,7 @@ torch.cuda.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False  
+torch.backends.cudnn.benchmark = False
 # Create a general generator for use with the validation dataloader,
 # the test dataloader, and the unsupervised dataloader
 general_generator = torch.Generator()
@@ -29,10 +30,72 @@ train_generator = torch.Generator()
 train_generator.manual_seed(RANDOM_SEED)
 
 
-def seed_worker(worker_seed = RANDOM_SEED):
+def seed_worker(worker_seed=RANDOM_SEED):
     # worker_seed = torch.initial_seed() % 2 ** 32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def build_spo2_balanced_sampler(dataset, bins=24, rarity_pow=0.7, std_boost=0.4):
+    """根据SpO2标签分布构建加权采样器。
+
+    - 稀有SpO2区间：更高采样权重
+    - chunk内标签方差更高：轻度增权（更有学习价值）
+    """
+    if not hasattr(dataset, 'labels_spo2') or len(dataset.labels_spo2) == 0:
+        return None
+
+    means = []
+    stds = []
+    for path in dataset.labels_spo2:
+        try:
+            arr = np.load(path).astype(np.float32).reshape(-1)
+            means.append(float(np.mean(arr)))
+            stds.append(float(np.std(arr)))
+        except Exception:
+            means.append(94.0)
+            stds.append(0.0)
+
+    means = np.asarray(means, dtype=np.float32)
+    stds = np.asarray(stds, dtype=np.float32)
+
+    if len(means) < 4:
+        return None
+
+    lo, hi = float(np.min(means)), float(np.max(means))
+    if hi - lo < 1e-6:
+        return None
+
+    hist_edges = np.linspace(lo, hi + 1e-6, bins + 1, dtype=np.float32)
+    bin_ids = np.clip(np.digitize(
+        means, hist_edges[1:-1], right=False), 0, bins - 1)
+    bin_counts = np.bincount(bin_ids, minlength=bins).astype(np.float32)
+    median_count = np.median(bin_counts[bin_counts > 0]) if np.any(
+        bin_counts > 0) else 1.0
+
+    rarity_weight = np.ones_like(means, dtype=np.float32)
+    for i in range(len(means)):
+        count = max(bin_counts[bin_ids[i]], 1.0)
+        rarity_weight[i] = (median_count / count) ** float(rarity_pow)
+
+    # chunk内SpO2方差增益：低方差不抛弃，只是降低优先级
+    std_norm = stds / (np.percentile(stds, 95) + 1e-6)
+    std_factor = 1.0 + float(std_boost) * np.clip(std_norm, 0.0, 1.0)
+
+    weights = rarity_weight * std_factor
+    weights = weights / (np.mean(weights) + 1e-8)
+    weights = np.clip(weights, 0.35, 4.0)
+
+    print("\n[SpO2 Balanced Sampling]")
+    print(
+        f"  Samples: {len(weights)} | SpO2 mean±std: {means.mean():.2f}±{means.std():.2f}")
+    print(f"  Weight range: {weights.min():.3f} ~ {weights.max():.3f}")
+
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
 
 
 def add_args(parser):
@@ -72,19 +135,26 @@ def add_args(parser):
 def train_and_test(config, data_loader_dict):
     """Trains the model."""
     if config.MODEL.NAME == "MultiPhysNet":
-        model_trainer = trainer.MultiPhysNetTrainer.MultiPhysNetTrainer(config, data_loader_dict)
+        model_trainer = trainer.MultiPhysNetTrainer.MultiPhysNetTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "iBVPNet":
-        model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(config, data_loader_dict)
+        model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "Tscan":
-        model_trainer = trainer.TscanTrainer.TscanTrainer(config, data_loader_dict)
+        model_trainer = trainer.TscanTrainer.TscanTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "EfficientPhys":
-        model_trainer = trainer.EfficientPhysTrainer.EfficientPhysTrainer(config, data_loader_dict)
+        model_trainer = trainer.EfficientPhysTrainer.EfficientPhysTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'DeepPhys':
-        model_trainer = trainer.DeepPhysTrainer.DeepPhysTrainer(config, data_loader_dict)
+        model_trainer = trainer.DeepPhysTrainer.DeepPhysTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'BigSmall':
-        model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(config, data_loader_dict)
+        model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'PhysFormer':
-        model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(config, data_loader_dict)
+        model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(
+            config, data_loader_dict)
     else:
         raise ValueError('Your Model is Not Supported  Yet!')
     model_trainer.train(data_loader_dict)
@@ -94,19 +164,26 @@ def train_and_test(config, data_loader_dict):
 def test(config, data_loader_dict):
     """Tests the model."""
     if config.MODEL.NAME == "MultiPhysNet":
-        model_trainer = trainer.MultiPhysNetTrainer.MultiPhysNetTrainer(config, data_loader_dict)
+        model_trainer = trainer.MultiPhysNetTrainer.MultiPhysNetTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "iBVPNet":
-        model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(config, data_loader_dict)
+        model_trainer = trainer.iBVPNetTrainer.iBVPNetTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "Tscan":
-        model_trainer = trainer.TscanTrainer.TscanTrainer(config, data_loader_dict)
+        model_trainer = trainer.TscanTrainer.TscanTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == "EfficientPhys":
-        model_trainer = trainer.EfficientPhysTrainer.EfficientPhysTrainer(config, data_loader_dict)
+        model_trainer = trainer.EfficientPhysTrainer.EfficientPhysTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'DeepPhys':
-        model_trainer = trainer.DeepPhysTrainer.DeepPhysTrainer(config, data_loader_dict)
+        model_trainer = trainer.DeepPhysTrainer.DeepPhysTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'BigSmall':
-        model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(config, data_loader_dict)
+        model_trainer = trainer.BigSmallTrainer.BigSmallTrainer(
+            config, data_loader_dict)
     elif config.MODEL.NAME == 'PhysFormer':
-        model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(config, data_loader_dict)
+        model_trainer = trainer.PhysFormerTrainer.PhysFormerTrainer(
+            config, data_loader_dict)
     else:
         raise ValueError('Your Model is Not Supported  Yet!')
     model_trainer.test(data_loader_dict)
@@ -153,7 +230,7 @@ if __name__ == "__main__":
     if args.path:
         config['LOG']['PATH'] = args.path
 
-    data_loader_dict = dict() # dictionary of data loaders
+    data_loader_dict = dict()  # dictionary of data loaders
     if config.TOOLBOX_MODE == "train_and_test":
         # train_loader
         if config.TRAIN.DATA.DATASET == "UBFC-rPPG":
@@ -190,14 +267,26 @@ if __name__ == "__main__":
                 name="train",
                 data_path=config.TRAIN.DATA.DATA_PATH,
                 config_data=config.TRAIN.DATA)
-            
-            # dataset=train_data_loader
-            # print(f"dataset: {len(dataset)}")
+
+            use_spo2_balanced_sampler = bool(
+                config.TASK in ["spo2", "both"] and
+                config.TRAIN.SPO2_BALANCED_SAMPLING
+            )
+            train_sampler = None
+            if use_spo2_balanced_sampler:
+                train_sampler = build_spo2_balanced_sampler(
+                    dataset=train_data_loader,
+                    bins=config.TRAIN.SPO2_SAMPLING_BINS,
+                    rarity_pow=config.TRAIN.SPO2_SAMPLING_POW,
+                    std_boost=config.TRAIN.SPO2_SAMPLING_STD_BOOST,
+                )
+
             data_loader_dict['train'] = DataLoader(
                 dataset=train_data_loader,
                 num_workers=16,
                 batch_size=config.TRAIN.BATCH_SIZE,
-                shuffle=True,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
                 worker_init_fn=seed_worker,
                 generator=train_generator
             )
@@ -226,7 +315,8 @@ if __name__ == "__main__":
         elif config.VALID.DATA.DATASET == "LADH":
             valid_loader = data_loader.LADHLoader.LADHLoader
         elif config.VALID.DATA.DATASET is None and not config.TEST.USE_LAST_EPOCH:
-            raise ValueError("Validation dataset not specified despite USE_LAST_EPOCH set to False!")
+            raise ValueError(
+                "Validation dataset not specified despite USE_LAST_EPOCH set to False!")
         else:
             raise ValueError("Unsupported dataset! Currently supporting UBFC-rPPG, PURE, MMPD, \
                              SCAMPS, BP4D+ (Normal and BigSmall preprocessing), UBFC-PHYS and iBVP")
@@ -253,7 +343,7 @@ if __name__ == "__main__":
         if args.model_path:
             config['INFERENCE']['MODEL_PATH'] = args.model_path
             print(f"Using model path: {config['INFERENCE']['MODEL_PATH']}")
-       
+
         # test_loader
         if config.TEST.DATA.DATASET == "UBFC-rPPG":
             test_loader = data_loader.UBFCrPPGLoader.UBFCrPPGLoader
@@ -280,7 +370,8 @@ if __name__ == "__main__":
                              SCAMPS, BP4D+ (Normal and BigSmall preprocessing), UBFC-PHYS and iBVP.")
 
         if config.TOOLBOX_MODE == "train_and_test" and config.TEST.USE_LAST_EPOCH:
-            print("Testing uses last epoch, validation dataset is not required.", end='\n\n')
+            print(
+                "Testing uses last epoch, validation dataset is not required.", end='\n\n')
 
         # Create and initialize the test dataloader given the correct toolbox mode,
         # a supported dataset name, and a valid dataset path
@@ -323,7 +414,7 @@ if __name__ == "__main__":
         else:
             raise ValueError("Unsupported dataset! Currently supporting UBFC-rPPG, PURE, MMPD, \
                              SCAMPS, BP4D+, UBFC-PHYS and iBVP.")
-        
+
         unsupervised_data = unsupervised_loader(
             name="unsupervised",
             data_path=config.UNSUPERVISED.DATA.DATA_PATH,
@@ -338,7 +429,8 @@ if __name__ == "__main__":
         )
 
     else:
-        raise ValueError("Unsupported toolbox_mode! Currently support train_and_test or only_test or unsupervised_method.")
+        raise ValueError(
+            "Unsupported toolbox_mode! Currently support train_and_test or only_test or unsupervised_method.")
 
     if config.TOOLBOX_MODE == "train_and_test":
         train_and_test(config, data_loader_dict)
