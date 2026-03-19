@@ -50,10 +50,25 @@ class MultiPhysNetTrainer(BaseTrainer):
         if config.TOOLBOX_MODE == "train_and_test":
             self.num_train_batches = len(data_loader["train"])
             self.loss_model = Neg_Pearson()
-            self.optimizer = optim.AdamW(
-                self.model.parameters(), lr=config.TRAIN.LR, weight_decay=1e-4)
+            # ★ 参数组分离：SpO2头部使用更高学习率加速收敛
+            spo2_params = []
+            other_params = []
+            for name, param in self.model.named_parameters():
+                if 'spo2' in name:
+                    spo2_params.append(param)
+                else:
+                    other_params.append(param)
+            spo2_lr_mult = getattr(config.TRAIN, 'SPO2_LR_MULT', 3.0)
+            self.optimizer = optim.AdamW([
+                {'params': other_params, 'lr': config.TRAIN.LR, 'weight_decay': 1e-4},
+                {'params': spo2_params, 'lr': config.TRAIN.LR * spo2_lr_mult, 'weight_decay': 5e-5},
+            ])
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                self.optimizer, max_lr=config.TRAIN.LR, epochs=config.TRAIN.EPOCHS, steps_per_epoch=self.num_train_batches)
+                self.optimizer,
+                max_lr=[config.TRAIN.LR, config.TRAIN.LR * spo2_lr_mult],
+                epochs=config.TRAIN.EPOCHS,
+                steps_per_epoch=self.num_train_batches)
+            self.spo2_loss_weight = getattr(config.TRAIN, 'SPO2_LOSS_WEIGHT', 0.85)
             self._prepare_spo2_label_histogram(data_loader)
         elif config.TOOLBOX_MODE == "only_test":
             pass
@@ -134,65 +149,66 @@ class MultiPhysNetTrainer(BaseTrainer):
         w = np.clip(w, 0.6, 3.5)
         return torch.as_tensor(w, dtype=spo2_label.dtype, device=spo2_label.device).view_as(spo2_label)
 
+    def _ccc_loss(self, pred, target):
+        """Concordance Correlation Coefficient loss.
+        CCC同时优化相关性和尺度一致性，是回归任务的最优损失选择。
+        CCC = 2*ρ*σx*σy / (σx² + σy² + (μx-μy)²)
+        """
+        pred_f = pred.flatten()
+        target_f = target.flatten()
+        if pred_f.numel() < 2:
+            return torch.tensor(0.0, device=pred.device)
+        pred_mean = pred_f.mean()
+        target_mean = target_f.mean()
+        pred_var = pred_f.var()
+        target_var = target_f.var()
+        covar = ((pred_f - pred_mean) * (target_f - target_mean)).mean()
+        ccc = (2.0 * covar) / (pred_var + target_var + (pred_mean - target_mean) ** 2 + 1e-8)
+        return 1.0 - ccc
+
     def _compute_spo2_loss(self, spo2_pred, spo2_label, multitask=False):
-        """SpO2损失：分布重加权回归 + 排序一致性 + 线性差分 + 统计匹配。"""
+        """SpO2损失：CCC（核心）+ 加权MAE + Huber + 排序一致性。"""
         sample_w = self._get_spo2_sample_weights(spo2_label)
-        sq_err = (spo2_pred - spo2_label) ** 2
-        huber = F.smooth_l1_loss(spo2_pred, spo2_label, reduction='none')
-        loss_mse = (sample_w * sq_err).mean()
+
+        # 1. CCC loss (核心): 直接优化一致性相关系数
+        loss_ccc = self._ccc_loss(spo2_pred, spo2_label)
+
+        # 2. 加权MAE: 稀有区间更敏感，梯度稳定
+        loss_mae = (sample_w * (spo2_pred - spo2_label).abs()).mean()
+
+        # 3. 加权Huber: 平衡大小误差
+        huber = F.smooth_l1_loss(spo2_pred, spo2_label, reduction='none', beta=1.5)
         loss_huber = (sample_w * huber).mean()
 
+        # 4. 排序一致性损失（随机采样对，降低计算量）
         pred_flat = spo2_pred.flatten()
         label_flat = spo2_label.flatten()
         n = pred_flat.shape[0]
         loss_rank = torch.tensor(0.0, device=spo2_pred.device)
-        loss_pair = torch.tensor(0.0, device=spo2_pred.device)
-        loss_var = torch.tensor(0.0, device=spo2_pred.device)
-        loss_mean = torch.tensor(0.0, device=spo2_pred.device)
 
         if n > 1:
-            pred_diff = pred_flat.unsqueeze(
-                1) - pred_flat.unsqueeze(0)   # [N, N]
-            label_diff = label_flat.unsqueeze(
-                1) - label_flat.unsqueeze(0)  # [N, N]
-
-            # 仅在有区分度的标签对上约束
-            valid_mask = (label_diff.abs() > 0.1)
-            if valid_mask.any():
-                target = torch.sign(label_diff[valid_mask])
-                # 标签差异越大，margin越大，提升线性区分能力
-                adaptive_margin = 0.12 + 0.35 * label_diff[valid_mask].abs()
-                rank_violations = torch.clamp(
-                    -target * pred_diff[valid_mask] + adaptive_margin, min=0)
-                loss_rank = rank_violations.mean()
-
-                # 差分线性损失：不仅顺序正确，还要差值接近
-                pair_w = torch.clamp(
-                    label_diff[valid_mask].abs(), min=0.1, max=6.0)
-                loss_pair = (
-                    pair_w * (pred_diff[valid_mask] - label_diff[valid_mask]).abs()).mean() / pair_w.mean()
-
-            pred_var = pred_flat.var()
-            label_var = label_flat.var().detach()
-            loss_var = (torch.sqrt(pred_var + 1e-6) -
-                        torch.sqrt(label_var + 1e-6)) ** 2
-            # 均值匹配：抑制整体偏移
-            loss_mean = (pred_flat.mean() - label_flat.mean().detach()) ** 2
+            max_pairs = min(n * (n - 1) // 2, 256)
+            idx_i = torch.randint(0, n, (max_pairs,), device=spo2_pred.device)
+            idx_j = torch.randint(0, n, (max_pairs,), device=spo2_pred.device)
+            label_diff = label_flat[idx_i] - label_flat[idx_j]
+            pred_diff = pred_flat[idx_i] - pred_flat[idx_j]
+            valid = label_diff.abs() > 0.3
+            if valid.any():
+                target_sign = torch.sign(label_diff[valid])
+                margin = 0.15 + 0.3 * label_diff[valid].abs()
+                rank_err = torch.clamp(-target_sign * pred_diff[valid] + margin, min=0)
+                loss_rank = rank_err.mean()
 
         base_loss = (
-            1.20 * loss_mse +
-            0.70 * loss_huber +
-            1.60 * loss_rank +
-            0.85 * loss_pair +
-            0.45 * loss_var +
-            0.30 * loss_mean
+            3.0 * loss_ccc +
+            1.0 * loss_mae +
+            0.5 * loss_huber +
+            1.5 * loss_rank
         )
 
         if multitask:
-            # 提升SpO2任务权重（由数据分析可知标签分布窄，需更强监督）
-            return 0.45 * base_loss
-        else:
-            return base_loss
+            return self.spo2_loss_weight * base_loss
+        return base_loss
 
     def train(self, data_loader):
         """Training routine for model"""

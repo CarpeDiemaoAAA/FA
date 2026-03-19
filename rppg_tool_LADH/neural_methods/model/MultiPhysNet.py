@@ -247,42 +247,46 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.Linear(48, 32),
         )
 
-        # SpO2预测头：48(rgb_high) + 48(ir_high) + 48(rgb_stats) + 48(ir_stats) + 32(cross) = 224
-        # 使用残差结构防止梯度消失，输出为SpO2偏移量
-        self.spo2_pre = nn.Sequential(
-            nn.Linear(224, 96),
-            nn.BatchNorm1d(96),
+        # 路径4：时序动态特征（捕获融合后脉搏波AC分量的时域模式——SpO2物理基础）
+        self.spo2_temporal_conv = nn.Sequential(
+            nn.Conv1d(64, 48, kernel_size=7, padding=3),
+            nn.BatchNorm1d(48),
             nn.GELU(),
-            nn.Dropout(0.15),
+            nn.Conv1d(48, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+        # SpO2预测头：48+48+48+48+32+32 = 256
+        # 深度残差结构：消除瓶颈，释放预测范围
+        self.spo2_pre = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.10),
         )
         self.spo2_head = nn.Sequential(
-            nn.Linear(96, 48),
-            nn.BatchNorm1d(48),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Linear(48, 1),
         )
-        # 尾部专家：针对稀有SpO2区间（低氧/高氧）单独建模
-        self.spo2_tail_head = nn.Sequential(
-            nn.Linear(96, 48),
-            nn.BatchNorm1d(48),
+        # 残差精炼块：深层网络保持梯度流通
+        self.spo2_refine = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Linear(48, 1),
+            nn.Dropout(0.06),
+            nn.Linear(64, 64),
         )
-        self.spo2_gate = nn.Sequential(
-            nn.Linear(96, 24),
-            nn.GELU(),
-            nn.Linear(24, 1),
-            nn.Sigmoid(),
-        )
-        # 残差快捷连接：直接从关键特征预测SpO2
-        self.spo2_shortcut = nn.Linear(224, 1)
+        self.spo2_final = nn.Linear(64, 1)
+        # 残差快捷连接：直接从原始特征预测SpO2偏移
+        self.spo2_shortcut = nn.Linear(256, 1)
 
-        # 可学习映射参数（由数据分布初始化）
-        # 训练集均值约94.4，采用可学习中心与尺度，避免固定映射造成压缩
+        # 可学习中心偏置（数据分布均值94.4作为初始锚点）
         self.spo2_center = nn.Parameter(
             torch.tensor(94.4, dtype=torch.float32))
-        self.spo2_scale_raw = nn.Parameter(
-            torch.tensor(2.95, dtype=torch.float32))
 
         self.ir_encoder = IR_SE_CNN()
         self.fusion_net = FusionNet()
@@ -309,12 +313,12 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         spo2_modules = [
             self.spo2_rgb_high, self.spo2_ir_high,
             self.spo2_rgb_stats, self.spo2_ir_stats,
-            self.spo2_cross_attn, self.spo2_pre, self.spo2_head,
-            self.spo2_tail_head, self.spo2_gate,
+            self.spo2_cross_attn, self.spo2_temporal_conv,
+            self.spo2_pre, self.spo2_head, self.spo2_refine,
         ]
         for module_list in spo2_modules:
             for m in module_list.modules():
-                if isinstance(m, nn.Linear):
+                if isinstance(m, (nn.Linear, nn.Conv1d)):
                     nn.init.kaiming_normal_(
                         m.weight, mode='fan_out', nonlinearity='relu')
                     if m.bias is not None:
@@ -322,9 +326,11 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
                 elif isinstance(m, nn.BatchNorm1d):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
-        # 快捷连接用小权重初始化（让残差起步时接近0）
+        # 快捷连接和最终层用小权重初始化（让残差起步时接近0）
         nn.init.normal_(self.spo2_shortcut.weight, std=0.01)
         nn.init.constant_(self.spo2_shortcut.bias, 0)
+        nn.init.normal_(self.spo2_final.weight, std=0.02)
+        nn.init.constant_(self.spo2_final.bias, 0)
 
     def forward(self, x1, x2=None):  # Batch_size*[3, T, 128,128]
         [batch, channel, length, width, height] = x1.shape
@@ -376,24 +382,28 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             ir_stats = torch.zeros(batch, 48, device=x.device)
             cross_feat = torch.zeros(batch, 32, device=x.device)
 
-        # 拼接所有特征
+        # 路径4：时序动态特征（从融合特征提取时域脉搏波模式）
+        fused_temporal = x.mean(dim=(-2, -1))  # [B, 64, T] 空间池化保留时序
+        temporal_feat = self.spo2_temporal_conv(fused_temporal)  # [B, 32]
+
+        # 拼接所有特征: 48+48+48+48+32+32 = 256
         spo2_feat = torch.cat(
-            [rgb_high, ir_high, rgb_stats, ir_stats, cross_feat], dim=1)  # [B, 224]
+            [rgb_high, ir_high, rgb_stats, ir_stats, cross_feat, temporal_feat], dim=1)
 
-        # 残差预测：主路径 + 快捷连接
-        spo2_main = self.spo2_pre(spo2_feat)        # [B, 96]
-        spo2_base = self.spo2_head(spo2_main)       # [B, 1]
-        spo2_tail = self.spo2_tail_head(spo2_main)  # [B, 1]
-        gate = self.spo2_gate(spo2_main)            # [B, 1]
-        spo2_main = (1.0 - gate) * spo2_base + gate * spo2_tail
-        spo2_skip = self.spo2_shortcut(spo2_feat)   # [B, 1]
-        spo2_offset = spo2_main + spo2_skip          # [B, 1]
+        # 深度残差预测头
+        spo2_pre = self.spo2_pre(spo2_feat)              # [B, 128]
+        spo2_h = self.spo2_head(spo2_pre)                # [B, 64]
+        spo2_r = self.spo2_refine(spo2_h) + spo2_h      # [B, 64] 残差连接
+        spo2_main = self.spo2_final(spo2_r)              # [B, 1]
+        spo2_skip = self.spo2_shortcut(spo2_feat)        # [B, 1]
+        spo2_offset = spo2_main + 0.1 * spo2_skip        # [B, 1]
 
-        spo2 = spo2_offset.view(batch, 1)
-        # 可学习软映射：大部分区域保持近线性，同时允许数据驱动中心/尺度自适应
-        # scale = 3 + softplus(raw) 保证正值且不至于过小
-        scale = 3.0 + F.softplus(self.spo2_scale_raw)
-        spo2 = self.spo2_center + scale * torch.tanh(spo2 / 2.0)
+        # ★ 线性输出 + 软边界（彻底消除tanh压缩，释放全部预测范围）
+        # 直接 center + offset 保持线性，不压缩梯度
+        spo2 = self.spo2_center + spo2_offset.view(batch, 1)
+        # 软边界：仅在超出生理范围时平滑截断 [75, 100]
+        spo2 = 75.0 + F.softplus(spo2 - 75.0)
+        spo2 = 100.0 - F.softplus(100.0 - spo2)
 
         return rPPG, spo2, rr
 
