@@ -167,20 +167,25 @@ class MultiPhysNetTrainer(BaseTrainer):
         return 1.0 - ccc
 
     def _compute_spo2_loss(self, spo2_pred, spo2_label, multitask=False):
-        """SpO2损失：CCC（核心）+ 加权MAE + Huber + 排序一致性。"""
+        """SpO2损失：加权MAE（核心）+ CCC + Huber + 排序一致性 + 方差保护。"""
         sample_w = self._get_spo2_sample_weights(spo2_label)
 
-        # 1. CCC loss (核心): 直接优化一致性相关系数
-        loss_ccc = self._ccc_loss(spo2_pred, spo2_label)
+        # 尾部距离加权：远离均值94.4的样本获得更高权重，直接对抗均值回归
+        tail_dist = (spo2_label - 94.4).abs()
+        tail_w = 1.0 + 0.6 * (tail_dist / 3.0).clamp(0, 2.5)
+        combined_w = sample_w * tail_w
 
-        # 2. 加权MAE: 稀有区间更敏感，梯度稳定
-        loss_mae = (sample_w * (spo2_pred - spo2_label).abs()).mean()
+        # 1. 加权MAE (核心): 直接优化目标指标
+        loss_mae = (combined_w * (spo2_pred - spo2_label).abs()).mean()
+
+        # 2. CCC loss: 优化一致性相关系数（降权避免小批量噪声）
+        loss_ccc = self._ccc_loss(spo2_pred, spo2_label)
 
         # 3. 加权Huber: 平衡大小误差
         huber = F.smooth_l1_loss(spo2_pred, spo2_label, reduction='none', beta=1.5)
-        loss_huber = (sample_w * huber).mean()
+        loss_huber = (combined_w * huber).mean()
 
-        # 4. 排序一致性损失（随机采样对，降低计算量）
+        # 4. 排序一致性损失（降低阈值捕获窄分布中的细微差异）
         pred_flat = spo2_pred.flatten()
         label_flat = spo2_label.flatten()
         n = pred_flat.shape[0]
@@ -192,18 +197,27 @@ class MultiPhysNetTrainer(BaseTrainer):
             idx_j = torch.randint(0, n, (max_pairs,), device=spo2_pred.device)
             label_diff = label_flat[idx_i] - label_flat[idx_j]
             pred_diff = pred_flat[idx_i] - pred_flat[idx_j]
-            valid = label_diff.abs() > 0.3
+            valid = label_diff.abs() > 0.15
             if valid.any():
                 target_sign = torch.sign(label_diff[valid])
-                margin = 0.15 + 0.3 * label_diff[valid].abs()
+                margin = 0.10 + 0.25 * label_diff[valid].abs()
                 rank_err = torch.clamp(-target_sign * pred_diff[valid] + margin, min=0)
                 loss_rank = rank_err.mean()
 
+        # 5. 方差保护：惩罚预测方差低于标签方差（仅单向惩罚收缩，不惩罚过度分散）
+        loss_var_protect = torch.tensor(0.0, device=spo2_pred.device)
+        if n > 1:
+            pred_std = pred_flat.std()
+            label_std = label_flat.std().detach()
+            var_deficit = torch.clamp(label_std - pred_std, min=0)
+            loss_var_protect = var_deficit ** 2
+
         base_loss = (
-            3.0 * loss_ccc +
-            1.0 * loss_mae +
-            0.5 * loss_huber +
-            1.5 * loss_rank
+            2.0 * loss_mae +
+            1.5 * loss_ccc +
+            0.6 * loss_huber +
+            1.0 * loss_rank +
+            0.8 * loss_var_protect
         )
 
         if multitask:
@@ -371,15 +385,16 @@ class MultiPhysNetTrainer(BaseTrainer):
                             (torch.std(rPPG) + 1e-8)
                         BVP_label = (BVP_label - torch.mean(BVP_label)
                                      ) / (torch.std(BVP_label) + 1e-8)
-                        rr_pred = (rr_pred - torch.mean(rr_pred)) / \
+                        rr_pred_norm = (rr_pred - torch.mean(rr_pred)) / \
                             (torch.std(rr_pred) + 1e-8)
-                        rr_label = (rr_label - torch.mean(rr_label)
+                        rr_label_norm = (rr_label - torch.mean(rr_label)
                                     ) / (torch.std(rr_label) + 1e-8)
 
                         loss_bvp = self.loss_model(rPPG, BVP_label)
                         loss_spo2 = self._compute_spo2_loss(
                             spo2_pred, spo2_label, multitask=True)
-                        loss_rr = self.loss_model(rr_pred, rr_label)
+                        loss_rr = self.loss_model(rr_pred_norm, rr_label_norm) + \
+                            0.3 * F.l1_loss(rr_pred_norm, rr_label_norm)
 
                         loss = loss_bvp + loss_spo2 + loss_rr
 
@@ -561,11 +576,16 @@ class MultiPhysNetTrainer(BaseTrainer):
                             (torch.std(rPPG) + 1e-8)
                         BVP_label = (BVP_label - torch.mean(BVP_label)
                                      ) / (torch.std(BVP_label) + 1e-8)
+                        rr_pred_norm = (rr_pred - torch.mean(rr_pred)) / \
+                            (torch.std(rr_pred) + 1e-8)
+                        rr_label_norm = (rr_label - torch.mean(rr_label)
+                                    ) / (torch.std(rr_label) + 1e-8)
 
                         loss_bvp = self.loss_model(rPPG, BVP_label)
                         loss_spo2 = self._compute_spo2_loss(
                             spo2_pred, spo2_label, multitask=True)
-                        loss_rr = self.loss_model(rr_pred, rr_label)
+                        loss_rr = self.loss_model(rr_pred_norm, rr_label_norm) + \
+                            0.3 * F.l1_loss(rr_pred_norm, rr_label_norm)
 
                         loss = loss_bvp + loss_spo2 + loss_rr
                         valid_loss_bvp += loss_bvp.item()

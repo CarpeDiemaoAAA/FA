@@ -265,7 +265,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(0.10),
+            nn.Dropout(0.05),
         )
         self.spo2_head = nn.Sequential(
             nn.Linear(128, 64),
@@ -277,7 +277,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
             nn.Linear(64, 64),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.Dropout(0.06),
+            nn.Dropout(0.03),
             nn.Linear(64, 64),
         )
         self.spo2_final = nn.Linear(64, 1)
@@ -329,7 +329,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         # 快捷连接和最终层用小权重初始化（让残差起步时接近0）
         nn.init.normal_(self.spo2_shortcut.weight, std=0.01)
         nn.init.constant_(self.spo2_shortcut.bias, 0)
-        nn.init.normal_(self.spo2_final.weight, std=0.02)
+        nn.init.normal_(self.spo2_final.weight, std=0.05)
         nn.init.constant_(self.spo2_final.bias, 0)
 
     def forward(self, x1, x2=None):  # Batch_size*[3, T, 128,128]
@@ -396,7 +396,7 @@ class PhysNet_padding_Encoder_Decoder_MAX(nn.Module):
         spo2_r = self.spo2_refine(spo2_h) + spo2_h      # [B, 64] 残差连接
         spo2_main = self.spo2_final(spo2_r)              # [B, 1]
         spo2_skip = self.spo2_shortcut(spo2_feat)        # [B, 1]
-        spo2_offset = spo2_main + 0.1 * spo2_skip        # [B, 1]
+        spo2_offset = spo2_main + 0.2 * spo2_skip        # [B, 1]
 
         # ★ 线性输出 + 软边界（彻底消除tanh压缩，释放全部预测范围）
         # 直接 center + offset 保持线性，不压缩梯度
